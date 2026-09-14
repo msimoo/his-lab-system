@@ -1,0 +1,1 @@
+<script>alert('$success'); window.open('$receipt_url','_blank'); setTimeout(function(){ location.reload(); }, 1000);</script>
