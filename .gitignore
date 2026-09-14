@@ -1,0 +1,19 @@
+# Local runtime files
+.sessions/
+sessions/
+.freebuff/
+*.log
+*.tmp
+*.cache
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Editor/project files
+.vscode/
+.idea/
+
+# PHP local caches
+vendor/
+composer.lock
