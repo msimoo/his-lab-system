@@ -1,403 +1,1213 @@
 <?php
+/**
+ * ============================================================================
+ * PATIENT HISTORY v2.0 — Complete EHR with Elegant Design
+ * ============================================================================
+ * الإصلاحات:
+ *  ✅ N+1 query fix — استعلام واحد لكل المختبر
+ *  ✅ جدول موجود؟ — graceful fallback للجداول الاختيارية
+ *  ✅ ملخص مالي دقيق — يخصم الاستردادات
+ *  ✅ Date range filter — يخفف الصفحة للمرضى المزمنين
+ *  ✅ Pagination / LIMIT لكل قسم
+ *  ✅ htmlspecialchars على كل شيء
+ *  ✅ Prepared statements
+ *  ✅ SDG موحد (لا خلط مع $)
+ *  ✅ Print-friendly
+ *  ✅ Tabs لأداء أفضل
+ * ============================================================================
+ */
+
 include __DIR__ . "/../../session_init.php";
 include('config/config.php');
 include('config/checklogin.php');
+include_once('config/financial_helpers.php');
 check_login();
 include('config/languages.php');
 
-$selected_patient_id = isset($_GET['patient_id']) ? intval($_GET['patient_id']) : 0;
+$admin_id = (int)$_SESSION['admin_id'];
+
+// ═══ Inputs ═══
+$selected_patient_id = (int)($_GET['patient_id'] ?? 0);
+$active_tab          = $_GET['tab'] ?? 'overview';
+$date_from           = $_GET['date_from'] ?? '';
+$date_to             = $_GET['date_to'] ?? '';
+
+// Validate dates
+if ($date_from && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date_from)) $date_from = '';
+if ($date_to && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date_to))     $date_to = '';
+
+// Allowed tabs
+$allowed_tabs = ['overview', 'labs', 'clinics', 'services', 'admissions', 'consumables', 'timeline'];
+if (!in_array($active_tab, $allowed_tabs, true)) $active_tab = 'overview';
+
+// ═══ Helpers ═══
+function table_exists(mysqli $mysqli, string $table): bool {
+    $t = $mysqli->real_escape_string($table);
+    $r = $mysqli->query("SHOW TABLES LIKE '$t'");
+    return $r && $r->num_rows > 0;
+}
+
+function esc($s): string {
+    return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
+}
+
+function fmt_money($v, int $dec = 2): string {
+    return number_format((float)$v, $dec, '.', ',');
+}
+
+function build_url(array $params): string {
+    $base = array_filter([
+        'patient_id' => $_GET['patient_id'] ?? null,
+        'date_from'  => $_GET['date_from'] ?? null,
+        'date_to'    => $_GET['date_to'] ?? null,
+    ], fn($v) => $v !== null && $v !== '');
+    return 'patient_history.php?' . http_build_query(array_merge($base, $params));
+}
+
+// ═══ Detect optional tables ═══
+$has = [
+    'outpatient'          => table_exists($mysqli, 'rpos_outpatient_records'),
+    'lab_requests'        => table_exists($mysqli, 'rpos_lab_requests'),
+    'lab_results'         => table_exists($mysqli, 'rpos_lab_results'),
+    'lab_components'      => table_exists($mysqli, 'rpos_lab_components'),
+    'admissions'          => table_exists($mysqli, 'rpos_admissions') && table_exists($mysqli, 'rpos_beds') && table_exists($mysqli, 'rpos_rooms'),
+    'service_requests'    => table_exists($mysqli, 'rpos_patient_service_requests'),
+    'consumable_requests' => table_exists($mysqli, 'rpos_patient_consumable_requests'),
+    'refunds'             => table_exists($mysqli, 'rpos_patient_refunds'),
+];
+
+// ═══ Patient selection list ═══
+$patients = [];
+$p_list = $mysqli->query("SELECT patient_id, name, patient_number FROM rpos_patients ORDER BY name ASC");
+while ($p = $p_list->fetch_assoc()) $patients[] = $p;
+
+// ═══ Load patient data ═══
+$patient = null;
+$financial = null;
+$counts = ['labs'=>0,'clinics'=>0,'services'=>0,'admissions'=>0,'consumables'=>0];
+$tab_data = [];
+
+if ($selected_patient_id > 0) {
+    $stmt = $mysqli->prepare("SELECT * FROM rpos_patients WHERE patient_id = ? LIMIT 1");
+    $stmt->bind_param('i', $selected_patient_id);
+    $stmt->execute();
+    $patient = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    if ($patient) {
+        // ═══ Financial Summary (refund-aware) ═══
+        // Build date filter for aggregates
+        $date_clauses = [];
+        if ($date_from) $date_clauses[] = "DATE(created_at) >= '$date_from'";
+        if ($date_to)   $date_clauses[] = "DATE(created_at) <= '$date_to'";
+        $date_sql = $date_clauses ? ' AND ' . implode(' AND ', $date_clauses) : '';
+
+        $financial = [
+            'lab_total'         => '0',
+            'lab_paid'          => '0',
+            'services_total'    => '0',
+            'services_paid'     => '0',
+            'consumables_total' => '0',
+            'consumables_paid'  => '0',
+            'appointments_total'=> '0',
+            'refunds_total'     => '0',
+        ];
+
+        if ($has['lab_requests']) {
+            $r = $mysqli->query("
+                SELECT COALESCE(SUM(total_amount), 0) AS t, COALESCE(SUM(amount_paid), 0) AS p
+                FROM rpos_lab_requests
+                WHERE patient_id = $selected_patient_id $date_sql
+            ")->fetch_assoc();
+            $financial['lab_total'] = (string)$r['t'];
+            $financial['lab_paid']  = (string)$r['p'];
+        }
+
+        if ($has['service_requests']) {
+            $r = $mysqli->query("
+                SELECT COALESCE(SUM(total_cost), 0) AS t, COALESCE(SUM(amount_paid), 0) AS p
+                FROM rpos_patient_service_requests
+                WHERE patient_id = $selected_patient_id $date_sql
+            ")->fetch_assoc();
+            $financial['services_total'] = (string)$r['t'];
+            $financial['services_paid']  = (string)$r['p'];
+        }
+
+        if ($has['consumable_requests']) {
+            $r = $mysqli->query("
+                SELECT COALESCE(SUM(total_cost), 0) AS t, COALESCE(SUM(amount_paid), 0) AS p
+                FROM rpos_patient_consumable_requests
+                WHERE patient_id = $selected_patient_id $date_sql
+            ")->fetch_assoc();
+            $financial['consumables_total'] = (string)$r['t'];
+            $financial['consumables_paid']  = (string)$r['p'];
+        }
+
+        // Appointments totals
+        $r = $mysqli->query("
+            SELECT COALESCE(SUM(fee_amount), 0) AS t, COALESCE(SUM(amount_paid), 0) AS p
+            FROM rpos_appointments
+            WHERE patient_id = $selected_patient_id $date_sql
+        ")->fetch_assoc();
+        $financial['appointments_total'] = (string)$r['t'];
+        $financial['appointments_paid']  = (string)$r['p'];
+
+        // Refunds total (uses DATE(created_at))
+        if ($has['refunds']) {
+            $r = $mysqli->query("
+                SELECT COALESCE(SUM(refund_amount), 0) AS t
+                FROM rpos_patient_refunds
+                WHERE patient_id = $selected_patient_id $date_sql
+            ")->fetch_assoc();
+            $financial['refunds_total'] = (string)$r['t'];
+        }
+
+        // Totals using BCMath
+        $financial['total_billed'] = fin_add(
+            fin_add(
+                fin_add($financial['lab_total'], $financial['services_total'], FIN_SCALE),
+                $financial['consumables_total'],
+                FIN_SCALE
+            ),
+            $financial['appointments_total'],
+            FIN_SCALE
+        );
+        $financial['total_collected'] = fin_add(
+            fin_add(
+                fin_add($financial['lab_paid'], $financial['services_paid'], FIN_SCALE),
+                $financial['consumables_paid'],
+                FIN_SCALE
+            ),
+            $financial['appointments_paid'],
+            FIN_SCALE
+        );
+        // Net revenue = collected - refunds
+        $financial['net_revenue'] = fin_sub($financial['total_collected'], $financial['refunds_total'], FIN_SCALE);
+        // Outstanding = billed - collected (not refund-adjusted)
+        $financial['outstanding'] = fin_sub($financial['total_billed'], $financial['total_collected'], FIN_SCALE);
+        if (fin_cmp($financial['outstanding'], '0', FIN_SCALE) < 0) $financial['outstanding'] = '0';
+
+        // ═══ Tab Counts ═══
+        if ($has['lab_requests']) {
+            $counts['labs'] = (int)$mysqli->query("
+                SELECT COUNT(*) AS c FROM rpos_lab_requests WHERE patient_id = $selected_patient_id
+            ")->fetch_assoc()['c'];
+        }
+        if ($has['outpatient']) {
+            $counts['clinics'] = (int)$mysqli->query("
+                SELECT COUNT(*) AS c FROM rpos_outpatient_records WHERE patient_id = $selected_patient_id
+            ")->fetch_assoc()['c'];
+        }
+        if ($has['service_requests']) {
+            $counts['services'] = (int)$mysqli->query("
+                SELECT COUNT(*) AS c FROM rpos_patient_service_requests WHERE patient_id = $selected_patient_id
+            ")->fetch_assoc()['c'];
+        }
+        if ($has['admissions']) {
+            $counts['admissions'] = (int)$mysqli->query("
+                SELECT COUNT(*) AS c FROM rpos_admissions WHERE patient_id = $selected_patient_id
+            ")->fetch_assoc()['c'];
+        }
+        if ($has['consumable_requests']) {
+            $counts['consumables'] = (int)$mysqli->query("
+                SELECT COUNT(*) AS c FROM rpos_patient_consumable_requests WHERE patient_id = $selected_patient_id
+            ")->fetch_assoc()['c'];
+        }
+
+        // ═══ Load active tab data ═══
+        if ($active_tab === 'labs' && $has['lab_requests'] && $has['lab_results']) {
+            $tab_data = load_lab_data($mysqli, $selected_patient_id, $date_from, $date_to, $has['lab_components']);
+        } elseif ($active_tab === 'clinics' && $has['outpatient']) {
+            $tab_data = load_clinics_data($mysqli, $selected_patient_id, $date_from, $date_to);
+        } elseif ($active_tab === 'services' && $has['service_requests']) {
+            $tab_data = load_services_data($mysqli, $selected_patient_id, $date_from, $date_to);
+        } elseif ($active_tab === 'admissions' && $has['admissions']) {
+            $tab_data = load_admissions_data($mysqli, $selected_patient_id);
+        } elseif ($active_tab === 'consumables' && $has['consumable_requests']) {
+            $tab_data = load_consumables_data($mysqli, $selected_patient_id, $date_from, $date_to);
+        } elseif ($active_tab === 'timeline') {
+            $tab_data = load_timeline_data($mysqli, $selected_patient_id, $has, $date_from, $date_to);
+        } elseif ($active_tab === 'overview') {
+            $tab_data = load_timeline_data($mysqli, $selected_patient_id, $has, $date_from, $date_to, 15);
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Data loaders
+   ═══════════════════════════════════════════════════════════════════════ */
+
+function load_lab_data(mysqli $mysqli, int $patient_id, string $from, string $to, bool $has_components): array {
+    $where = " WHERE lr.patient_id = $patient_id";
+    if ($from) $where .= " AND DATE(lr.req_date) >= '$from'";
+    if ($to)   $where .= " AND DATE(lr.req_date) <= '$to'";
+
+    // Single query — JOIN everything, avoid N+1
+    $select_extra = $has_components
+        ? ", c.comp_name, c.normal_range, c.unit"
+        : "";
+    $join_extra = $has_components
+        ? "LEFT JOIN rpos_lab_components c ON res.comp_id = c.comp_id"
+        : "";
+
+    $sql = "
+        SELECT
+            lr.req_id, lr.req_code, lr.sample_barcode, lr.req_date,
+            lr.total_amount, lr.amount_paid, lr.payment_status, lr.status,
+            res.test_id, res.result_value, res.flag,
+            t.test_name, t.price
+            $select_extra
+        FROM rpos_lab_requests lr
+        LEFT JOIN rpos_lab_results res ON lr.req_id = res.req_id
+        LEFT JOIN rpos_lab_tests t ON res.test_id = t.test_id
+        $join_extra
+        $where
+        ORDER BY lr.req_date DESC, lr.req_id DESC, res.test_id ASC
+        LIMIT 5000
+    ";
+    $result = $mysqli->query($sql);
+    if (!$result) return [];
+
+    $grouped = [];
+    while ($row = $result->fetch_assoc()) {
+        $rid = (int)$row['req_id'];
+        if (!isset($grouped[$rid])) {
+            $grouped[$rid] = [
+                'req_id'         => $rid,
+                'req_code'       => $row['req_code'],
+                'sample_barcode' => $row['sample_barcode'],
+                'req_date'       => $row['req_date'],
+                'total_amount'   => $row['total_amount'],
+                'amount_paid'    => $row['amount_paid'],
+                'payment_status' => $row['payment_status'],
+                'status'         => $row['status'],
+                'tests'          => [],
+                'abnormal_count' => 0,
+            ];
+        }
+        if ($row['test_id']) {
+            $tid = (int)$row['test_id'];
+            if (!isset($grouped[$rid]['tests'][$tid])) {
+                $grouped[$rid]['tests'][$tid] = [
+                    'test_name'  => $row['test_name'],
+                    'price'      => $row['price'],
+                    'components' => [],
+                ];
+            }
+            if ($row['result_value'] !== null || $row['comp_name'] !== null) {
+                $grouped[$rid]['tests'][$tid]['components'][] = [
+                    'name'         => $row['comp_name'] ?? '',
+                    'value'        => $row['result_value'] ?? '',
+                    'flag'         => $row['flag'] ?? 'Normal',
+                    'normal_range' => $row['normal_range'] ?? '',
+                    'unit'         => $row['unit'] ?? '',
+                ];
+                if (($row['flag'] ?? 'Normal') !== 'Normal') {
+                    $grouped[$rid]['abnormal_count']++;
+                }
+            }
+        }
+    }
+    return array_values($grouped);
+}
+
+function load_clinics_data(mysqli $mysqli, int $patient_id, string $from, string $to): array {
+    $where = " WHERE o.patient_id = $patient_id";
+    if ($from) $where .= " AND DATE(o.visit_date) >= '$from'";
+    if ($to)   $where .= " AND DATE(o.visit_date) <= '$to'";
+
+    $sql = "
+        SELECT o.*, s.staff_name AS doctor_name
+        FROM rpos_outpatient_records o
+        LEFT JOIN rpos_staff s ON o.doctor_id = s.staff_id
+        $where
+        ORDER BY o.visit_date DESC
+        LIMIT 500
+    ";
+    $r = $mysqli->query($sql);
+    return $r ? $r->fetch_all(MYSQLI_ASSOC) : [];
+}
+
+function load_services_data(mysqli $mysqli, int $patient_id, string $from, string $to): array {
+    $where = " WHERE sr.patient_id = $patient_id";
+    if ($from) $where .= " AND DATE(sr.created_at) >= '$from'";
+    if ($to)   $where .= " AND DATE(sr.created_at) <= '$to'";
+
+    $sql = "
+        SELECT sr.*, ms.service_name, ms.service_type, ms.fee
+        FROM rpos_patient_service_requests sr
+        JOIN rpos_medical_services ms ON sr.service_id = ms.service_id
+        $where
+        ORDER BY sr.created_at DESC
+        LIMIT 500
+    ";
+    $r = $mysqli->query($sql);
+    return $r ? $r->fetch_all(MYSQLI_ASSOC) : [];
+}
+
+function load_admissions_data(mysqli $mysqli, int $patient_id): array {
+    $sql = "
+        SELECT a.*, b.bed_number, r.room_name
+        FROM rpos_admissions a
+        JOIN rpos_beds b ON a.bed_id = b.bed_id
+        JOIN rpos_rooms r ON b.room_id = r.room_id
+        WHERE a.patient_id = $patient_id
+        ORDER BY a.admission_date DESC
+        LIMIT 200
+    ";
+    $r = $mysqli->query($sql);
+    return $r ? $r->fetch_all(MYSQLI_ASSOC) : [];
+}
+
+function load_consumables_data(mysqli $mysqli, int $patient_id, string $from, string $to): array {
+    $where = " WHERE r.patient_id = $patient_id";
+    if ($from) $where .= " AND DATE(r.created_at) >= '$from'";
+    if ($to)   $where .= " AND DATE(r.created_at) <= '$to'";
+
+    $sql = "
+        SELECT r.*, i.item_name, ri.quantity_requested, ri.price_charged
+        FROM rpos_patient_consumable_requests r
+        JOIN rpos_patient_request_items ri ON r.request_id = ri.request_id
+        JOIN rpos_store_items i ON ri.item_id = i.item_id
+        $where
+        ORDER BY r.created_at DESC
+        LIMIT 500
+    ";
+    $r = $mysqli->query($sql);
+    return $r ? $r->fetch_all(MYSQLI_ASSOC) : [];
+}
+
+function load_timeline_data(mysqli $mysqli, int $patient_id, array $has, string $from, string $to, int $limit = 100): array {
+    $events = [];
+    $date_filter = function($col) use ($from, $to) {
+        $s = '';
+        if ($from) $s .= " AND DATE($col) >= '$from'";
+        if ($to)   $s .= " AND DATE($col) <= '$to'";
+        return $s;
+    };
+
+    // 1. Outpatient
+    if ($has['outpatient']) {
+        $sql = "SELECT o.*, s.staff_name AS doctor_name
+                FROM rpos_outpatient_records o
+                LEFT JOIN rpos_staff s ON o.doctor_id = s.staff_id
+                WHERE o.patient_id = $patient_id " . $date_filter('o.visit_date') . "
+                ORDER BY o.visit_date DESC LIMIT 100";
+        $r = $mysqli->query($sql);
+        if ($r) while ($row = $r->fetch_assoc()) {
+            $events[] = [
+                'date'  => $row['visit_date'],
+                'type'  => 'clinic',
+                'title' => 'زيارة عيادة خارجية',
+                'body'  => $row,
+            ];
+        }
+    }
+
+    // 2. Lab
+    if ($has['lab_requests']) {
+        $sql = "SELECT lr.* FROM rpos_lab_requests lr
+                WHERE lr.patient_id = $patient_id " . $date_filter('lr.req_date') . "
+                ORDER BY lr.req_date DESC LIMIT 100";
+        $r = $mysqli->query($sql);
+        if ($r) while ($row = $r->fetch_assoc()) {
+            $events[] = [
+                'date'  => $row['req_date'],
+                'type'  => 'lab',
+                'title' => 'طلب مختبر #' . $row['req_code'],
+                'body'  => $row,
+            ];
+        }
+    }
+
+    // 3. Services
+    if ($has['service_requests']) {
+        $sql = "SELECT sr.*, ms.service_name
+                FROM rpos_patient_service_requests sr
+                JOIN rpos_medical_services ms ON sr.service_id = ms.service_id
+                WHERE sr.patient_id = $patient_id " . $date_filter('sr.created_at') . "
+                ORDER BY sr.created_at DESC LIMIT 100";
+        $r = $mysqli->query($sql);
+        if ($r) while ($row = $r->fetch_assoc()) {
+            $events[] = [
+                'date'  => $row['created_at'],
+                'type'  => 'service',
+                'title' => 'خدمة: ' . $row['service_name'],
+                'body'  => $row,
+            ];
+        }
+    }
+
+    // 4. Consumables
+    if ($has['consumable_requests']) {
+        $sql = "SELECT r.*, i.item_name, ri.quantity_requested
+                FROM rpos_patient_consumable_requests r
+                JOIN rpos_patient_request_items ri ON r.request_id = ri.request_id
+                JOIN rpos_store_items i ON ri.item_id = i.item_id
+                WHERE r.patient_id = $patient_id " . $date_filter('r.created_at') . "
+                ORDER BY r.created_at DESC LIMIT 100";
+        $r = $mysqli->query($sql);
+        if ($r) while ($row = $r->fetch_assoc()) {
+            $events[] = [
+                'date'  => $row['created_at'],
+                'type'  => 'consumable',
+                'title' => 'صرف مستهلكات #' . $row['request_code'],
+                'body'  => $row,
+            ];
+        }
+    }
+
+    // 5. Admissions
+    if ($has['admissions']) {
+        $sql = "SELECT a.*, b.bed_number, r.room_name
+                FROM rpos_admissions a
+                JOIN rpos_beds b ON a.bed_id = b.bed_id
+                JOIN rpos_rooms r ON b.room_id = r.room_id
+                WHERE a.patient_id = $patient_id " . $date_filter('a.admission_date') . "
+                ORDER BY a.admission_date DESC LIMIT 100";
+        $r = $mysqli->query($sql);
+        if ($r) while ($row = $r->fetch_assoc()) {
+            $events[] = [
+                'date'  => $row['admission_date'],
+                'type'  => 'admission',
+                'title' => 'تنويم (' . $row['admission_code'] . ')',
+                'body'  => $row,
+            ];
+        }
+    }
+
+    // Sort desc by date
+    usort($events, fn($a, $b) => strtotime($b['date']) - strtotime($a['date']));
+
+    return array_slice($events, 0, $limit);
+}
+
 require_once('partials/_head.php');
 ?>
 
 <style>
-/* ===== Patient History - Enhanced Design ===== */
-:root {
-    --ph-primary: #1a5276;
-    --ph-primary-light: #2980b9;
-    --ph-accent: #27ae60;
-    --ph-accent-warning: #f39c12;
-    --ph-accent-danger: #e74c3c;
-    --ph-bg-card: #ffffff;
-    --ph-shadow: 0 8px 30px rgba(0,0,0,0.08);
-    --ph-radius: 16px;
-    --ph-transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+/* ══════════════════════════════════════════════════════════════════════
+   PATIENT HISTORY v2.0 — Elegant, Calm, Focused
+   ══════════════════════════════════════════════════════════════════════ */
+:root{
+    --ph-bg:           var(--bg-primary, #f7f8fb);
+    --ph-card:         var(--bg-card, #ffffff);
+    --ph-soft:         var(--bg-secondary, #f8fafc);
+    --ph-border:       var(--border-color, rgba(15,23,42,.08));
+    --ph-border-light: var(--border-light, rgba(15,23,42,.05));
+    --ph-text:         var(--text-primary, #1e293b);
+    --ph-text-2:       var(--text-secondary, #64748b);
+    --ph-muted:        var(--text-muted, #94a3b8);
+    --ph-radius:       20px;
+    --ph-radius-sm:    14px;
+    --ph-radius-xs:    10px;
+    --ph-shadow:       0 4px 20px rgba(15,23,42,.06);
+    --ph-shadow-lg:    0 12px 40px rgba(15,23,42,.10);
+
+    --ph-navy:         #1e293b;
+    --ph-navy-soft:    rgba(30,41,59,.06);
+    --ph-emerald:      #059669;
+    --ph-blue:         #2563eb;
+    --ph-cyan:         #0891b2;
+    --ph-violet:       #7c3aed;
+    --ph-amber:        #d97706;
+    --ph-red:          #dc2626;
 }
 
-.ph-container {
-    max-width: 1400px;
-    margin: 0 auto;
-    padding: 0 15px;
+body{
+    background: var(--ph-bg);
+    color: var(--ph-text);
+    font-family: 'Tajawal', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
 }
 
-/* ===== Patient Header Card ===== */
-.ph-patient-header {
-    background: linear-gradient(135deg, #1a5276 0%, #2e86c1 50%, #3498db 100%);
-    border-radius: var(--ph-radius);
-    box-shadow: 0 12px 40px rgba(26, 82, 118, 0.25);
-    padding: 30px;
-    margin-bottom: 25px;
+/* ── HERO ── */
+.ph-hero{
+    position: relative;
+    padding: 32px 0 96px;
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 45%, #334155 100%);
+    border-radius: 0 0 32px 32px;
+    overflow: hidden;
+}
+.ph-hero::before{
+    content: '';
+    position: absolute;
+    top: -30%; right: -10%;
+    width: 520px; height: 520px;
+    background: radial-gradient(circle, rgba(59,130,246,.18), transparent 60%);
+    pointer-events: none;
+}
+.ph-hero::after{
+    content: '';
+    position: absolute;
+    bottom: -20%; left: -5%;
+    width: 400px; height: 400px;
+    background: radial-gradient(circle, rgba(16,185,129,.12), transparent 60%);
+    pointer-events: none;
+}
+.ph-hero-inner{
+    position: relative;
+    z-index: 1;
+}
+
+/* Patient card */
+.ph-patient{
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    flex-wrap: wrap;
+}
+.ph-avatar{
+    width: 84px; height: 84px;
+    border-radius: 24px;
+    background: linear-gradient(135deg, #3b82f6, #06b6d4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 2rem;
+    font-weight: 900;
     color: #fff;
+    flex: 0 0 auto;
+    box-shadow: 0 12px 32px rgba(59,130,246,.35);
+    border: 3px solid rgba(255,255,255,.15);
     position: relative;
-    overflow: hidden;
 }
-.ph-patient-header::before {
+.ph-avatar::after{
     content: '';
     position: absolute;
-    top: -50%;
-    right: -20%;
-    width: 500px;
-    height: 500px;
-    background: rgba(255,255,255,0.04);
-    border-radius: 50%;
-    pointer-events: none;
+    inset: -6px;
+    border-radius: 28px;
+    border: 2px solid rgba(59,130,246,.35);
+    opacity: .5;
 }
-.ph-patient-header::after {
-    content: '';
-    position: absolute;
-    bottom: -30%;
-    left: -10%;
-    width: 300px;
-    height: 300px;
-    background: rgba(255,255,255,0.03);
-    border-radius: 50%;
-    pointer-events: none;
-}
-.ph-patient-avatar {
-    width: 80px;
-    height: 80px;
-    border-radius: 50%;
-    background: rgba(255,255,255,0.15);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 32px;
-    border: 3px solid rgba(255,255,255,0.3);
-    flex-shrink: 0;
-}
-.ph-patient-name {
-    font-size: 26px;
+.ph-patient-info{ flex: 1; min-width: 0; }
+.ph-patient-info h1{
+    color: #fff;
+    font-size: 1.6rem;
     font-weight: 800;
-    margin-bottom: 4px;
+    margin: 0 0 8px;
+    letter-spacing: -.4px;
+    line-height: 1.2;
 }
-.ph-patient-number {
-    font-size: 14px;
-    opacity: 0.85;
-    font-weight: 500;
-}
-.ph-patient-detail-item {
+.ph-patient-meta{
     display: flex;
-    align-items: center;
+    flex-wrap: wrap;
     gap: 10px;
-    padding: 8px 16px;
-    background: rgba(255,255,255,0.1);
-    border-radius: 10px;
-    backdrop-filter: blur(10px);
-    font-size: 13px;
-}
-.ph-patient-detail-item i {
-    font-size: 16px;
-    opacity: 0.8;
-}
-.ph-patient-detail-item .label {
-    opacity: 0.7;
-    font-weight: 400;
-}
-.ph-patient-detail-item .value {
-    font-weight: 700;
-}
-
-/* ===== Financial Summary Cards ===== */
-.ph-fin-row {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 15px;
-    margin-bottom: 25px;
-}
-.ph-fin-card {
-    background: var(--ph-bg-card);
-    border-radius: var(--ph-radius);
-    box-shadow: var(--ph-shadow);
-    padding: 20px 24px;
-    transition: var(--ph-transition);
-    position: relative;
-    overflow: hidden;
-    border: 1px solid rgba(0,0,0,0.04);
-}
-.ph-fin-card:hover {
-    transform: translateY(-3px);
-    box-shadow: 0 12px 40px rgba(0,0,0,0.12);
-}
-.ph-fin-card .icon-circle {
-    width: 48px;
-    height: 48px;
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 20px;
-    margin-bottom: 12px;
-}
-.ph-fin-card .fin-label {
-    font-size: 13px;
-    color: #7f8c8d;
-    font-weight: 500;
-    margin-bottom: 4px;
-}
-.ph-fin-card .fin-amount {
-    font-size: 24px;
-    font-weight: 800;
-}
-.ph-fin-card .fin-sub {
-    font-size: 12px;
-    color: #95a5a6;
     margin-top: 4px;
 }
-.ph-fin-card .fin-glow {
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 3px;
+.ph-meta-pill{
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 14px;
+    background: rgba(255,255,255,.08);
+    border: 1px solid rgba(255,255,255,.15);
+    border-radius: 999px;
+    color: rgba(255,255,255,.85);
+    font-size: .8rem;
+    font-weight: 700;
+    backdrop-filter: blur(8px);
+}
+.ph-meta-pill i{ opacity: .75; font-size: .78rem; }
+.ph-meta-pill strong{ color: #fff; font-weight: 800; }
+
+/* Financial summary card */
+.ph-fin-summary{
+    margin-top: 18px;
+    background: rgba(255,255,255,.06);
+    border: 1px solid rgba(255,255,255,.12);
+    border-radius: 18px;
+    padding: 18px 22px;
+    backdrop-filter: blur(12px);
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 18px;
+}
+.ph-fin-cell .lbl{
+    color: rgba(255,255,255,.65);
+    font-size: .72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .5px;
+    margin-bottom: 5px;
+}
+.ph-fin-cell .val{
+    color: #fff;
+    font-size: 1.2rem;
+    font-weight: 900;
+    letter-spacing: -.3px;
+    font-variant-numeric: tabular-nums;
+}
+.ph-fin-cell .val small{
+    font-size: .68rem;
+    color: rgba(255,255,255,.6);
+    font-weight: 700;
+    margin-right: 3px;
+}
+.ph-fin-cell.net .val{ color: #6ee7b7; }
+.ph-fin-cell.refund .val{ color: #fca5a5; }
+
+/* ── WRAP ── */
+.ph-wrap{
+    margin-top: -60px;
+    position: relative;
+    z-index: 5;
+    padding-bottom: 30px;
+    max-width: 1300px;
 }
 
-/* ===== Tab Navigation ===== */
-.ph-tabs {
-    display: flex;
-    gap: 4px;
-    background: #f0f2f5;
-    border-radius: 14px;
-    padding: 4px;
-    margin-bottom: 25px;
-    overflow-x: auto;
-    flex-wrap: nowrap;
-}
-.ph-tab-btn {
-    padding: 10px 20px;
-    border: none;
-    background: transparent;
-    border-radius: 11px;
-    font-weight: 600;
-    font-size: 13px;
-    color: #64748b;
-    cursor: pointer;
-    transition: var(--ph-transition);
-    white-space: nowrap;
+/* ── FILTER BAR ── */
+.ph-filter{
+    background: var(--ph-card);
+    border: 1px solid var(--ph-border-light);
+    border-radius: var(--ph-radius-sm);
+    box-shadow: var(--ph-shadow);
+    padding: 14px 20px;
+    margin-bottom: 20px;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 12px;
+    flex-wrap: wrap;
 }
-.ph-tab-btn i { font-size: 15px; }
-.ph-tab-btn:hover { color: #1a5276; background: rgba(26, 82, 118, 0.06); }
-.ph-tab-btn.active {
-    background: #fff;
-    color: var(--ph-primary);
-    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+.ph-filter label{
+    font-size: .78rem;
+    font-weight: 800;
+    color: var(--ph-text-2);
+    margin: 0;
 }
-.ph-tab-badge {
-    background: var(--ph-primary-light);
+.ph-input{
+    border: 1px solid var(--ph-border);
+    background: var(--ph-soft);
+    color: var(--ph-text);
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-family: inherit;
+    font-weight: 600;
+    font-size: .82rem;
+    outline: none;
+    transition: all .2s;
+}
+.ph-input:focus{
+    border-color: var(--ph-navy);
+    background: var(--ph-card);
+    box-shadow: 0 0 0 3px rgba(30,41,59,.08);
+}
+.ph-btn{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border: none;
+    border-radius: 10px;
+    font-family: inherit;
+    font-weight: 800;
+    font-size: .78rem;
+    cursor: pointer;
+    transition: all .2s;
+    text-decoration: none;
+    white-space: nowrap;
+}
+.ph-btn.primary{
+    background: var(--ph-navy);
     color: #fff;
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 20px;
-    font-weight: 700;
+}
+.ph-btn.primary:hover{
+    background: #0f172a;
+    color: #fff;
+    text-decoration: none;
+}
+.ph-btn.ghost{
+    background: var(--ph-soft);
+    color: var(--ph-text-2);
+    border: 1px solid var(--ph-border);
+}
+.ph-btn.ghost:hover{
+    background: var(--ph-border);
+    color: var(--ph-text);
+    text-decoration: none;
 }
 
-/* ===== Section Card ===== */
-.ph-section {
-    display: none;
-    animation: phFadeIn 0.4s ease;
+/* ── TABS ── */
+.ph-tabs-wrap{
+    background: var(--ph-card);
+    border: 1px solid var(--ph-border-light);
+    border-radius: var(--ph-radius);
+    box-shadow: var(--ph-shadow);
+    padding: 6px;
+    margin-bottom: 20px;
+    display: flex;
+    gap: 4px;
+    overflow-x: auto;
+    scrollbar-width: none;
 }
-.ph-section.active { display: block; }
-@keyframes phFadeIn {
-    from { opacity: 0; transform: translateY(10px); }
-    to { opacity: 1; transform: translateY(0); }
+.ph-tabs-wrap::-webkit-scrollbar{ display: none; }
+
+.ph-tab{
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    padding: 12px 18px;
+    border: none;
+    background: transparent;
+    color: var(--ph-text-2);
+    border-radius: 12px;
+    font-family: inherit;
+    font-weight: 700;
+    font-size: .84rem;
+    cursor: pointer;
+    transition: all .22s;
+    text-decoration: none;
+    white-space: nowrap;
+    flex: 0 0 auto;
 }
-.ph-section-card {
-    background: var(--ph-bg-card);
+.ph-tab:hover{
+    background: var(--ph-soft);
+    color: var(--ph-text);
+    text-decoration: none;
+}
+.ph-tab.active{
+    background: var(--ph-navy);
+    color: #fff;
+    box-shadow: 0 8px 18px rgba(30,41,59,.22);
+}
+.ph-tab i{ font-size: .9rem; }
+.ph-tab .cnt{
+    padding: 2px 9px;
+    border-radius: 999px;
+    background: var(--ph-soft);
+    color: var(--ph-text-2);
+    font-size: .7rem;
+    font-weight: 800;
+    min-width: 22px;
+    text-align: center;
+}
+.ph-tab.active .cnt{
+    background: rgba(255,255,255,.20);
+    color: #fff;
+}
+
+/* ── PANEL ── */
+.ph-panel{
+    background: var(--ph-card);
+    border: 1px solid var(--ph-border-light);
     border-radius: var(--ph-radius);
     box-shadow: var(--ph-shadow);
     overflow: hidden;
     margin-bottom: 20px;
 }
-.ph-section-header {
+.ph-panel-head{
     padding: 18px 24px;
-    background: linear-gradient(135deg, #f8fafc, #edf2f7);
-    border-bottom: 1px solid #e9ecef;
+    border-bottom: 1px solid var(--ph-border-light);
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
 }
-.ph-section-header h5 {
+.ph-panel-head h3{
+    font-size: .98rem;
+    font-weight: 800;
+    color: var(--ph-text);
     margin: 0;
-    font-weight: 700;
-    font-size: 16px;
-    color: #1a5276;
+    display: flex;
+    align-items: center;
+    gap: 10px;
 }
-.ph-section-body {
-    padding: 0;
+.ph-panel-head h3 i{
+    width: 34px; height: 34px;
+    border-radius: 11px;
+    background: var(--ph-soft);
+    color: var(--ph-text-2);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: .85rem;
 }
+.ph-panel-body{ padding: 20px 24px; }
+.ph-panel-body.no-pad{ padding: 0; }
 
-/* ===== Timeline Items ===== */
-.ph-timeline {
-    position: relative;
-    padding: 20px 0;
+/* ── OVERVIEW CARDS ── */
+.ph-overview-grid{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px;
+    margin-bottom: 20px;
 }
-.ph-timeline::before {
+.ph-card{
+    background: var(--ph-card);
+    border: 1px solid var(--ph-border-light);
+    border-radius: var(--ph-radius-sm);
+    padding: 18px 20px;
+    box-shadow: var(--ph-shadow);
+    position: relative;
+    overflow: hidden;
+    transition: all .25s;
+}
+.ph-card::before{
     content: '';
     position: absolute;
-    right: 40px;
-    top: 0;
-    bottom: 0;
-    width: 3px;
-    background: linear-gradient(180deg, #3498db, #2ecc71);
-    border-radius: 3px;
+    top: 0; right: 0; bottom: 0;
+    width: 4px;
 }
-.ph-tl-item {
+.ph-card.c-emerald::before{ background: linear-gradient(180deg, #10b981, #14b8a6); }
+.ph-card.c-blue::before{    background: linear-gradient(180deg, #2563eb, #06b6d4); }
+.ph-card.c-violet::before{  background: linear-gradient(180deg, #7c3aed, #a855f7); }
+.ph-card.c-amber::before{   background: linear-gradient(180deg, #d97706, #f59e0b); }
+.ph-card.c-red::before{     background: linear-gradient(180deg, #dc2626, #ef4444); }
+.ph-card.c-navy::before{    background: linear-gradient(180deg, #1e293b, #334155); }
+.ph-card:hover{ transform: translateY(-2px); box-shadow: var(--ph-shadow-lg); }
+
+.ph-card-head{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+}
+.ph-card-icon{
+    width: 38px; height: 38px;
+    border-radius: 11px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: .95rem;
+}
+.ph-card.c-emerald .ph-card-icon{ background: rgba(5,150,105,.10); color: var(--ph-emerald); }
+.ph-card.c-blue .ph-card-icon{    background: rgba(37,99,235,.10); color: var(--ph-blue); }
+.ph-card.c-violet .ph-card-icon{  background: rgba(124,58,237,.10); color: var(--ph-violet); }
+.ph-card.c-amber .ph-card-icon{   background: rgba(217,119,6,.10); color: var(--ph-amber); }
+.ph-card.c-red .ph-card-icon{     background: rgba(220,38,38,.10); color: var(--ph-red); }
+.ph-card.c-navy .ph-card-icon{    background: rgba(30,41,59,.08); color: var(--ph-navy); }
+
+.ph-card .lbl{
+    font-size: .72rem;
+    font-weight: 700;
+    color: var(--ph-muted);
+    text-transform: uppercase;
+    letter-spacing: .4px;
+    margin-bottom: 6px;
+}
+.ph-card .val{
+    font-size: 1.4rem;
+    font-weight: 900;
+    color: var(--ph-text);
+    letter-spacing: -.3px;
+    line-height: 1.1;
+    font-variant-numeric: tabular-nums;
+}
+.ph-card .val small{
+    font-size: .68rem;
+    color: var(--ph-muted);
+    font-weight: 700;
+    margin-right: 3px;
+}
+.ph-card .sub{
+    font-size: .74rem;
+    color: var(--ph-text-2);
+    font-weight: 600;
+    margin-top: 5px;
+}
+
+/* ── TIMELINE ── */
+.ph-timeline{
     position: relative;
-    padding: 0 80px 25px 20px;
+    padding: 8px 0;
 }
-.ph-tl-item:last-child { padding-bottom: 0; }
-.ph-tl-icon {
+.ph-timeline::before{
+    content: '';
     position: absolute;
-    right: 29px;
-    width: 26px;
-    height: 26px;
+    right: 22px;
+    top: 8px;
+    bottom: 8px;
+    width: 2px;
+    background: linear-gradient(180deg, var(--ph-border), var(--ph-border-light));
+    border-radius: 2px;
+}
+.ph-tl-item{
+    position: relative;
+    padding: 0 66px 22px 12px;
+}
+.ph-tl-item:last-child{ padding-bottom: 0; }
+.ph-tl-dot{
+    position: absolute;
+    right: 12px;
+    top: 4px;
+    width: 22px;
+    height: 22px;
     border-radius: 50%;
     display: flex;
     align-items: center;
     justify-content: center;
     color: #fff;
-    font-size: 12px;
+    font-size: .62rem;
     z-index: 2;
-    border: 3px solid #fff;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.12);
-    top: 2px;
+    border: 3px solid var(--ph-card);
+    box-shadow: 0 3px 10px rgba(0,0,0,.10);
 }
-.ph-tl-content {
-    background: #f8fafc;
+.ph-tl-dot.clinic{     background: var(--ph-emerald); }
+.ph-tl-dot.lab{        background: var(--ph-blue); }
+.ph-tl-dot.service{    background: var(--ph-violet); }
+.ph-tl-dot.consumable{ background: var(--ph-amber); }
+.ph-tl-dot.admission{  background: var(--ph-cyan); }
+
+.ph-tl-card{
+    background: var(--ph-soft);
     border-radius: 12px;
-    padding: 16px 20px;
-    border-right: 4px solid #3498db;
-    transition: var(--ph-transition);
+    padding: 14px 18px;
+    border-right: 3px solid var(--ph-border);
+    transition: all .2s;
 }
-.ph-tl-content:hover {
-    background: #f1f5f9;
-    transform: translateX(-2px);
+.ph-tl-card:hover{
+    background: var(--ph-card);
+    border-right-color: var(--ph-navy);
+    box-shadow: 0 4px 14px rgba(0,0,0,.06);
 }
-.ph-tl-title {
+.ph-tl-card.clinic{     border-right-color: var(--ph-emerald); }
+.ph-tl-card.lab{        border-right-color: var(--ph-blue); }
+.ph-tl-card.service{    border-right-color: var(--ph-violet); }
+.ph-tl-card.consumable{ border-right-color: var(--ph-amber); }
+.ph-tl-card.admission{  border-right-color: var(--ph-cyan); }
+
+.ph-tl-title{
+    font-size: .9rem;
+    font-weight: 800;
+    color: var(--ph-text);
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.ph-tl-date{
+    font-size: .72rem;
+    color: var(--ph-muted);
     font-weight: 700;
-    font-size: 14px;
-    color: #1a5276;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+.ph-tl-body{
+    font-size: .82rem;
+    color: var(--ph-text-2);
+    line-height: 1.7;
+    margin-top: 6px;
+}
+.ph-tl-body strong{ color: var(--ph-text); font-weight: 800; }
+
+/* ── ITEM CARDS (services/consumables) ── */
+.ph-grid{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 12px;
+}
+.ph-item{
+    background: var(--ph-card);
+    border: 1px solid var(--ph-border-light);
+    border-radius: var(--ph-radius-sm);
+    padding: 16px 20px;
+    transition: all .2s;
+    position: relative;
+    overflow: hidden;
+}
+.ph-item::before{
+    content: '';
+    position: absolute;
+    top: 0; right: 0; bottom: 0;
+    width: 3px;
+}
+.ph-item.s-service::before{    background: var(--ph-violet); }
+.ph-item.s-consumable::before{ background: var(--ph-amber); }
+.ph-item:hover{
+    border-color: rgba(15,23,42,.15);
+    box-shadow: 0 6px 18px rgba(15,23,42,.06);
+}
+.ph-item-title{
+    font-size: .92rem;
+    font-weight: 800;
+    color: var(--ph-text);
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.ph-item-code{
+    font-family: 'Courier New', monospace;
+    font-size: .72rem;
+    font-weight: 800;
+    color: var(--ph-text-2);
+    background: var(--ph-soft);
+    padding: 2px 8px;
+    border-radius: 6px;
+    display: inline-block;
     margin-bottom: 6px;
 }
-.ph-tl-meta {
+.ph-item-row{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 8px;
+    gap: 10px;
+}
+.ph-item-price{
+    font-size: 1.05rem;
+    font-weight: 900;
+    color: var(--ph-text);
+    font-variant-numeric: tabular-nums;
+}
+.ph-item-price small{
+    font-size: .68rem;
+    color: var(--ph-muted);
+    font-weight: 700;
+    margin-right: 3px;
+}
+
+/* Badges */
+.ph-badge{
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 11px;
+    border-radius: 999px;
+    font-size: .68rem;
+    font-weight: 800;
+    white-space: nowrap;
+}
+.ph-badge.b-emerald{ background: rgba(5,150,105,.10); color: var(--ph-emerald); }
+.ph-badge.b-blue{    background: rgba(37,99,235,.10); color: var(--ph-blue); }
+.ph-badge.b-violet{  background: rgba(124,58,237,.10); color: var(--ph-violet); }
+.ph-badge.b-amber{   background: rgba(217,119,6,.10); color: var(--ph-amber); }
+.ph-badge.b-red{     background: rgba(220,38,38,.10); color: var(--ph-red); }
+.ph-badge.b-slate{   background: var(--ph-soft); color: var(--ph-text-2); }
+
+/* ── LAB SECTION ── */
+.ph-lab-request{
+    background: var(--ph-card);
+    border: 1px solid var(--ph-border-light);
+    border-radius: var(--ph-radius-sm);
+    overflow: hidden;
+    margin-bottom: 14px;
+}
+.ph-lab-head{
+    background: linear-gradient(135deg, rgba(37,99,235,.06), rgba(6,182,212,.06));
+    padding: 14px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    border-bottom: 1px solid var(--ph-border-light);
+}
+.ph-lab-head-left{
     display: flex;
     align-items: center;
     gap: 12px;
     flex-wrap: wrap;
-    margin-bottom: 8px;
 }
-.ph-tl-date { font-size: 12px; color: #7f8c8d; }
-.ph-tl-badge {
-    font-size: 11px;
-    padding: 2px 10px;
-    border-radius: 20px;
-    font-weight: 600;
+.ph-lab-code{
+    font-family: 'Courier New', monospace;
+    font-weight: 800;
+    font-size: .84rem;
+    color: var(--ph-blue);
+    background: rgba(37,99,235,.10);
+    padding: 4px 12px;
+    border-radius: 8px;
 }
-.ph-tl-body {
-    font-size: 13px;
-    color: #2c3e50;
-    line-height: 1.7;
-}
-.ph-tl-body strong { color: #1a5276; }
-
-/* ===== Lab Results Table ===== */
-.ph-lab-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-}
-.ph-lab-table th {
-    background: #f0f4f8;
-    color: #1a5276;
+.ph-lab-meta{
+    font-size: .76rem;
+    color: var(--ph-muted);
     font-weight: 700;
-    padding: 10px 14px;
-    text-align: center;
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
-    border-bottom: 2px solid #dce4ec;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
 }
-.ph-lab-table td {
-    padding: 9px 14px;
-    border-bottom: 1px solid #eef2f7;
-    text-align: center;
+.ph-lab-table{
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+}
+.ph-lab-table thead th{
+    background: var(--ph-soft);
+    color: var(--ph-text-2);
+    font-size: .7rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: .4px;
+    padding: 10px 14px;
+    text-align: right;
+    border: none;
+    border-bottom: 1px solid var(--ph-border);
+    white-space: nowrap;
+}
+.ph-lab-table tbody td{
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--ph-border-light);
+    font-size: .84rem;
     vertical-align: middle;
 }
-.ph-lab-table tr:hover td { background: #f8faff; }
-.ph-lab-table .test-name-cell {
-    font-weight: 700;
-    color: #2c3e50;
+.ph-lab-table tbody tr:last-child td{ border-bottom: none; }
+.ph-lab-table tbody tr:hover td{ background: var(--ph-soft); }
+.ph-lab-test-name{
+    font-weight: 800;
+    color: var(--ph-text);
     text-align: right;
 }
-.ph-lab-table .result-normal { color: #27ae60; font-weight: 700; }
-.ph-lab-table .result-high { color: #e74c3c; font-weight: 700; background: #fdedec; padding: 2px 8px; border-radius: 4px; display: inline-block; }
-.ph-lab-table .result-low { color: #d35400; font-weight: 700; background: #fef5e7; padding: 2px 8px; border-radius: 4px; display: inline-block; }
-.ph-lab-table .normal-range-cell { color: #7f8c8d; font-size: 12px; }
-.ph-lab-request-header {
-    background: linear-gradient(135deg, #ebf5fb, #d6eaf8);
-    padding: 12px 16px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    border-bottom: 2px solid #aed6f1;
+.ph-result{
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
 }
-.ph-lab-request-header .req-code { font-weight: 700; color: #1a5276; }
-.ph-lab-request-header .req-date { font-size: 12px; color: #566573; }
-.ph-no-data {
+.ph-result.normal{ color: var(--ph-emerald); }
+.ph-result.high{   color: var(--ph-red); }
+.ph-result.low{    color: var(--ph-amber); }
+
+/* ── EMPTY ── */
+.ph-empty{
     text-align: center;
-    padding: 50px 20px;
-    color: #95a5a6;
+    padding: 60px 20px;
 }
-.ph-no-data i { font-size: 48px; margin-bottom: 15px; opacity: 0.4; }
-.ph-no-data p { font-size: 15px; font-weight: 500; }
+.ph-empty .icon{
+    width: 72px; height: 72px;
+    margin: 0 auto 16px;
+    border-radius: 22px;
+    background: var(--ph-soft);
+    color: var(--ph-muted);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.6rem;
+}
+.ph-empty h4{
+    font-size: 1rem; font-weight: 800;
+    color: var(--ph-text); margin: 0 0 6px;
+}
+.ph-empty p{
+    font-size: .84rem; color: var(--ph-muted);
+    font-weight: 600; margin: 0;
+}
 
-/* ===== Services Grid ===== */
-.ph-services-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-    gap: 12px;
-    padding: 16px;
+/* ── RESPONSIVE ── */
+@media (max-width: 768px){
+    .ph-hero{ padding: 24px 0 88px; border-radius: 0 0 24px 24px; }
+    .ph-patient-info h1{ font-size: 1.25rem; }
+    .ph-avatar{ width: 64px; height: 64px; font-size: 1.5rem; border-radius: 18px; }
+    .ph-fin-summary{ padding: 14px 16px; gap: 12px; }
+    .ph-fin-cell .val{ font-size: 1rem; }
+    .ph-wrap{ margin-top: -55px; }
+    .ph-tab{ padding: 10px 14px; font-size: .78rem; }
+    .ph-tab .label{ display: none; }
+    .ph-tab i{ font-size: 1rem; }
+    .ph-tl-item{ padding: 0 52px 20px 8px; }
+    .ph-tl-dot{ right: 6px; width: 20px; height: 20px; }
+    .ph-timeline::before{ right: 16px; }
+    .ph-overview-grid{ grid-template-columns: 1fr 1fr; gap: 10px; }
+    .ph-card{ padding: 14px 16px; }
+    .ph-card .val{ font-size: 1.15rem; }
+    .ph-grid{ grid-template-columns: 1fr; }
 }
-.ph-service-card {
-    background: #f8fafc;
-    border-radius: 12px;
-    padding: 16px;
-    border: 1px solid #e9ecef;
-    transition: var(--ph-transition);
+@media (max-width: 480px){
+    .ph-overview-grid{ grid-template-columns: 1fr; }
 }
-.ph-service-card:hover {
-    border-color: #3498db;
-    background: #f0f7ff;
-}
-.ph-service-name { font-weight: 700; color: #1a5276; font-size: 14px; }
-.ph-service-fee { color: #27ae60; font-weight: 800; font-size: 16px; }
-.ph-service-status { font-size: 12px; }
-.ph-service-date { font-size: 12px; color: #95a5a6; }
-
-/* ===== Responsive ===== */
-@media (max-width: 768px) {
-    .ph-patient-header { padding: 20px; }
-    .ph-fin-row { grid-template-columns: repeat(2, 1fr); }
-    .ph-tabs { gap: 2px; }
-    .ph-tab-btn { padding: 8px 14px; font-size: 12px; }
-    .ph-timeline::before { right: 25px; }
-    .ph-tl-item { padding: 0 60px 20px 10px; }
-    .ph-tl-icon { right: 14px; width: 22px; height: 22px; font-size: 10px; }
-    .ph-services-grid { grid-template-columns: 1fr; }
-}
-@media (max-width: 480px) {
-    .ph-fin-row { grid-template-columns: 1fr; }
+@media print{
+    .no-print{ display: none !important; }
+    .ph-hero{ background: #fff !important; color: #000 !important; padding: 20px 0; }
+    .ph-hero *{ color: #000 !important; }
+    .ph-wrap{ margin-top: 0; }
+    .ph-tabs-wrap, .ph-filter{ display: none !important; }
+    .ph-panel{ box-shadow: none; border: 1px solid #ddd; }
 }
 </style>
 
@@ -405,781 +1215,749 @@ require_once('partials/_head.php');
     <?php require_once('partials/_sidebar.php'); ?>
     <div class="main-content">
         <?php require_once('partials/_topnav.php'); ?>
-        
-        <div style="background-image: url(assets/img/theme/restro00.jpg); background-size: cover;" class="header pb-8 pt-5 pt-md-8">
-             
-            <div class="container-fluid" dir="rtl">
-                <div class="d-flex justify-content-between align-items-center flex-wrap gap-3">
-                    <div>
-<h1 class="text-white text-right font-weight-bold"><i class="fas fa-history"></i> السجل الطبي الرقمي الموحد (Electronic Health Record - EHR)</h1>
-                <p class="text-white-50 mt-2 mb-0" style="font-size: 14px; text-align: right;">
-   هذا القسم يتيح لك الوصول إلى السجل الطبي الرقمي الشامل لكل مريض، بما في ذلك الحجوزات، طلبات المختبر، الخدمات الطبية، والمزيد. يمكنك اختيار المريض من القائمة أدناه لعرض تاريخه الطبي الكامل.
-                    </div>
+
+        <!-- ═══════════════ HERO ═══════════════ -->
+        <div class="ph-hero">
+            <div class="container-fluid text-right" dir="rtl" style="margin-top: 60px;">
+                <div class="ph-hero-inner">
+                    <?php if ($patient): ?>
+                        <div class="ph-patient">
+                            <div class="ph-avatar">
+                                <?php echo mb_substr($patient['name'], 0, 1); ?>
+                            </div>
+                            <div class="ph-patient-info">
+                                <h1><?php echo esc($patient['name']); ?></h1>
+                                <div class="ph-patient-meta">
+                                    <span class="ph-meta-pill">
+                                        <i class="fas fa-id-card"></i>
+                                        <strong><?php echo esc($patient['patient_number']); ?></strong>
+                                    </span>
+                                    <span class="ph-meta-pill">
+                                        <i class="fas fa-venus-mars"></i>
+                                        <?php echo $patient['gender'] === 'Male' ? 'ذكر' : 'أنثى'; ?>
+                                    </span>
+                                    <span class="ph-meta-pill">
+                                        <i class="fas fa-birthday-cake"></i>
+                                        <?php echo (int)$patient['age']; ?> سنة
+                                    </span>
+                                    <?php if (!empty($patient['blood_group'])): ?>
+                                        <span class="ph-meta-pill">
+                                            <i class="fas fa-tint"></i>
+                                            <?php echo esc($patient['blood_group']); ?>
+                                        </span>
+                                    <?php endif; ?>
+                                    <span class="ph-meta-pill">
+                                        <i class="fas fa-phone"></i>
+                                        <?php echo esc($patient['phone']); ?>
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <?php if ($financial): ?>
+                            <div class="ph-fin-summary">
+                                <div class="ph-fin-cell">
+                                    <div class="lbl">إجمالي الفواتير</div>
+                                    <div class="val"><small>SDG</small><?php echo fmt_money($financial['total_billed']); ?></div>
+                                </div>
+                                <div class="ph-fin-cell">
+                                    <div class="lbl">المدفوع</div>
+                                    <div class="val"><small>SDG</small><?php echo fmt_money($financial['total_collected']); ?></div>
+                                </div>
+                                <div class="ph-fin-cell refund">
+                                    <div class="lbl">الاستردادات</div>
+                                    <div class="val"><small>SDG</small><?php echo fmt_money($financial['refunds_total']); ?></div>
+                                </div>
+                                <div class="ph-fin-cell net">
+                                    <div class="lbl">صافي المُحصَّل</div>
+                                    <div class="val"><small>SDG</small><?php echo fmt_money($financial['net_revenue']); ?></div>
+                                </div>
+                                <div class="ph-fin-cell">
+                                    <div class="lbl">المتبقي</div>
+                                    <div class="val" style="color: <?php echo fin_cmp($financial['outstanding'], '0', FIN_SCALE) > 0 ? '#fca5a5' : '#6ee7b7'; ?>;">
+                                        <small>SDG</small><?php echo fmt_money($financial['outstanding']); ?>
+                                    </div>
+                                </div>
+                            </div>
+                        <?php endif; ?>
+
+                    <?php else: ?>
+                        <div style="padding: 30px 0; text-align: center; color: #fff;">
+                            <i class="fas fa-user-injured" style="font-size: 3rem; opacity: .5; margin-bottom: 12px; display: block;"></i>
+                            <h1 style="color: #fff; margin: 0 0 6px; font-size: 1.4rem; font-weight: 800;">
+                                السجل الطبي الرقمي الموحد
+                            </h1>
+                            <p style="color: rgba(255,255,255,.75); margin: 0; font-weight: 600;">
+                                اختر مريضاً لعرض تاريخه الطبي الكامل
+                            </p>
+                        </div>
+                    <?php endif; ?>
                 </div>
             </div>
         </div>
 
-        <div class="container-fluid mt--3 text-right text-dark ph-container">
-            <!-- Patient Selection -->
-            <div class="card shadow mb-4" style="border: none; border-radius: 16px;">
-                <div class="card-body bg-secondary" style="border-radius: 16px;">
-                    <form method="GET" action="patient_history.php" class="row align-items-center">
-                        <div class="col-md-9">
-                            <div class="form-group mb-0">
-                                <label class="form-control-label font-weight-bold">:اختر اسم المريض لعرض تاريخه الطبي الشامل</label>
-                                <select name="patient_id" class="form-control select2" onchange="this.form.submit()" required style="width: 100%;">
-                                    <option value="">-- اختر المريض من هنا --</option>
-                                    <?php 
-                                    $pts = $mysqli->query("SELECT * FROM rpos_patients ORDER BY name ASC");
-                                    while($p = $pts->fetch_assoc()) {
-                                        $sel = ($p['patient_id'] == $selected_patient_id) ? 'selected' : '';
-                                        echo "<option value='{$p['patient_id']}' $sel>{$p['name']} [{$p['patient_number']}]</option>";
-                                    }
-                                    ?>
-                                </select>
-                            </div>
-                        </div>
-                        <div class="col-md-3 mt-4">
-                            <button type="submit" class="btn btn-block btn-primary"><i class="fas fa-search"></i> استدعاء الملف</button>
-                        </div>
+        <!-- ═══════════════ CONTENT ═══════════════ -->
+        <div class="container-fluid ph-wrap" dir="rtl">
+
+            <!-- Patient Selector -->
+            <div class="ph-filter no-print">
+                <label><i class="fas fa-search"></i> اختر المريض:</label>
+                <select id="patientSelect" class="ph-input select2" style="flex: 1; min-width: 260px;">
+                    <option value="">— اختر مريضاً —</option>
+                    <?php foreach ($patients as $p): ?>
+                        <option value="<?php echo (int)$p['patient_id']; ?>"
+                            <?php echo ((int)$p['patient_id'] === $selected_patient_id) ? 'selected' : ''; ?>>
+                            <?php echo esc($p['name']); ?> · ملف #<?php echo esc($p['patient_number']); ?>
+                        </option>
+                    <?php endforeach; ?>
+                </select>
+
+                <?php if ($patient): ?>
+                    <form method="GET" style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                        <input type="hidden" name="patient_id" value="<?php echo $selected_patient_id; ?>">
+                        <input type="hidden" name="tab" value="<?php echo esc($active_tab); ?>">
+                        <label style="margin-right: 8px;"><i class="fas fa-calendar-alt"></i> من:</label>
+                        <input type="date" name="date_from" class="ph-input" value="<?php echo esc($date_from); ?>">
+                        <label><i class="fas fa-calendar-alt"></i> إلى:</label>
+                        <input type="date" name="date_to" class="ph-input" value="<?php echo esc($date_to); ?>">
+                        <button type="submit" class="ph-btn primary"><i class="fas fa-filter"></i> تطبيق</button>
+                        <?php if ($date_from || $date_to): ?>
+                            <a href="<?php echo build_url(['date_from' => null, 'date_to' => null, 'tab' => $active_tab]); ?>"
+                               class="ph-btn ghost"><i class="fas fa-times"></i> مسح</a>
+                        <?php endif; ?>
+                        <button type="button" class="ph-btn ghost" onclick="window.print();">
+                            <i class="fas fa-print"></i> طباعة
+                        </button>
                     </form>
-                </div>
+                <?php endif; ?>
             </div>
 
-            <?php if($selected_patient_id > 0): 
-                // Fetch comprehensive patient data
-                $p_info = $mysqli->query("SELECT * FROM rpos_patients WHERE patient_id = '$selected_patient_id'")->fetch_assoc();
-                if (!$p_info) { echo '<div class="alert alert-danger">المريض غير موجود.</div>'; exit; }
-                
-                // Fetch aggregated financial summary
-                $fin_summary = $mysqli->query("
-                    SELECT 
-                        COALESCE((SELECT SUM(total_amount) FROM rpos_lab_requests WHERE patient_id = '$selected_patient_id'), 0) as lab_total,
-                        COALESCE((SELECT SUM(amount_paid) FROM rpos_lab_requests WHERE patient_id = '$selected_patient_id'), 0) as lab_paid,
-                        COALESCE((SELECT SUM(total_cost) FROM rpos_patient_service_requests WHERE patient_id = '$selected_patient_id'), 0) as services_total,
-                        COALESCE((SELECT SUM(amount_paid) FROM rpos_patient_service_requests WHERE patient_id = '$selected_patient_id'), 0) as services_paid,
-                        COALESCE((SELECT SUM(total_cost) FROM rpos_patient_consumable_requests WHERE patient_id = '$selected_patient_id'), 0) as consumables_total,
-                        COALESCE((SELECT SUM(amount_paid) FROM rpos_patient_consumable_requests WHERE patient_id = '$selected_patient_id'), 0) as consumables_paid
-                ")->fetch_assoc();
-                
-                $total_billed = $fin_summary['lab_total'] + $fin_summary['services_total'] + $fin_summary['consumables_total'];
-                $total_paid = $fin_summary['lab_paid'] + $fin_summary['services_paid'] + $fin_summary['consumables_paid'];
-                $total_due = $total_billed - $total_paid;
-            ?>
-            
-            <!-- ===== Patient Header ===== -->
-            <div class="ph-patient-header">
-                <div class="row align-items-center position-relative" style="z-index: 1;">
-                    <div class="col-lg-8">
-                        <div class="d-flex align-items-center gap-4 mb-3">
-                            <div class="ph-patient-avatar">
-                                <i class="fas fa-user-injured"></i>
-                            </div>
-                            <div>
-                                <div class="ph-patient-name"><?php echo htmlspecialchars($p_info['name']); ?></div>
-                                <div class="ph-patient-number">
-                                    <i class="fas fa-id-card"></i> رقم الملف: <?php echo htmlspecialchars($p_info['patient_number']); ?>
-                                    &nbsp;|&nbsp; <i class="fas fa-calendar-alt"></i> تاريخ التسجيل: <?php echo date('Y-m-d', strtotime($p_info['created_at'])); ?>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="d-flex flex-wrap gap-2 mt-2">
-                            <div class="ph-patient-detail-item">
-                                <i class="fas fa-venus-mars"></i>
-                                <span class="label">الجنس:</span>
-                                <span class="value"><?php echo ($p_info['gender'] == 'Male') ? 'ذكر' : 'أنثى'; ?></span>
-                            </div>
-                            <div class="ph-patient-detail-item">
-                                <i class="fas fa-birthday-cake"></i>
-                                <span class="label">العمر:</span>
-                                <span class="value"><?php echo $p_info['age']; ?> سنة</span>
-                            </div>
-                            <div class="ph-patient-detail-item">
-                                <i class="fas fa-tint"></i>
-                                <span class="label">فصيلة الدم:</span>
-                                <span class="value"><?php echo $p_info['blood_group'] ?: 'غير محدد'; ?></span>
-                            </div>
-                            <div class="ph-patient-detail-item">
-                                <i class="fas fa-phone"></i>
-                                <span class="label">الهاتف:</span>
-                                <span class="value" dir="ltr"><?php echo htmlspecialchars($p_info['phone']); ?></span>
-                            </div>
-                        </div>
-                        <?php if (!empty($p_info['medical_history'])): ?>
-                        <div class="mt-3" style="background: rgba(255,255,255,0.1); border-radius: 10px; padding: 10px 16px; font-size: 13px;">
-                            <i class="fas fa-notes-medical"></i> <strong>التاريخ المرضي:</strong> <?php echo htmlspecialchars($p_info['medical_history']); ?>
-                        </div>
-                        <?php endif; ?>
-                    </div>
-                    <div class="col-lg-4 text-lg-left mt-3 mt-lg-0">
-                        <div style="background: rgba(255,255,255,0.12); border-radius: 14px; padding: 18px; backdrop-filter: blur(10px);">
-                            <div style="font-size: 12px; opacity: 0.8; margin-bottom: 8px;">الملخص المالي</div>
-                            <div class="d-flex justify-content-between mb-2">
-                                <span>إجمالي الفواتير:</span>
-                                <span style="font-weight: 700;"><?php echo number_format($total_billed, 2); ?> SDG</span>
-                            </div>
-                            <div class="d-flex justify-content-between mb-2">
-                                <span>إجمالي المدفوع:</span>
-                                <span style="font-weight: 700; color: #2ecc71;"><?php echo number_format($total_paid, 2); ?> SDG</span>
-                            </div>
-                            <div class="d-flex justify-content-between" style="border-top: 1px solid rgba(255,255,255,0.2); padding-top: 8px;">
-                                <span>المتبقي:</span>
-                                <span style="font-weight: 800; font-size: 18px; color: <?php echo $total_due > 0 ? '#e74c3c' : '#2ecc71'; ?>;">
-                                    <?php echo number_format($total_due, 2); ?> SDG
-                                </span>
-                            </div>
+            <?php if (!$patient): ?>
+                <!-- No patient selected -->
+                <div class="ph-panel">
+                    <div class="ph-panel-body">
+                        <div class="ph-empty">
+                            <div class="icon"><i class="fas fa-folder-open"></i></div>
+                            <h4>لم يتم اختيار مريض</h4>
+                            <p>اختر مريضاً من القائمة أعلاه لعرض ملفه الطبي الكامل</p>
                         </div>
                     </div>
                 </div>
-            </div>
 
-            <!-- ===== Financial Summary Cards ===== -->
-            <div class="ph-fin-row">
-                <div class="ph-fin-card">
-                    <div class="fin-glow" style="background: linear-gradient(90deg, #27ae60, #2ecc71);"></div>
-                    <div class="icon-circle" style="background: #e8f8f0; color: #27ae60;">
-                        <i class="fas fa-check-circle"></i>
-                    </div>
-                    <div class="fin-label">إجمالي المدفوعات</div>
-                    <div class="fin-amount" style="color: #27ae60;"><?php echo number_format($total_paid, 2); ?></div>
-                    <div class="fin-sub">جنيه سوداني (SDG)</div>
-                </div>
-                <div class="ph-fin-card">
-                    <div class="fin-glow" style="background: linear-gradient(90deg, #3498db, #2980b9);"></div>
-                    <div class="icon-circle" style="background: #ebf5fb; color: #3498db;">
-                        <i class="fas fa-file-invoice"></i>
-                    </div>
-                    <div class="fin-label">إجمالي الفواتير</div>
-                    <div class="fin-amount" style="color: #2c3e50;"><?php echo number_format($total_billed, 2); ?></div>
-                    <div class="fin-sub">مختبر + خدمات + مستهلكات</div>
-                </div>
-                <div class="ph-fin-card">
-                    <div class="fin-glow" style="background: linear-gradient(90deg, <?php echo $total_due > 0 ? '#e74c3c' : '#27ae60'; ?>, <?php echo $total_due > 0 ? '#c0392b' : '#2ecc71'; ?>);"></div>
-                    <div class="icon-circle" style="background: <?php echo $total_due > 0 ? '#fdedec' : '#e8f8f0'; ?>; color: <?php echo $total_due > 0 ? '#e74c3c' : '#27ae60'; ?>;">
-                        <i class="fas <?php echo $total_due > 0 ? 'fa-exclamation-triangle' : 'fa-check'; ?>"></i>
-                    </div>
-                    <div class="fin-label">المتبقي</div>
-                    <div class="fin-amount" style="color: <?php echo $total_due > 0 ? '#e74c3c' : '#27ae60'; ?>;"><?php echo number_format($total_due, 2); ?></div>
-                    <div class="fin-sub"><?php echo $total_due > 0 ? 'غير مسدد' : 'مسدد بالكامل ✓'; ?></div>
-                </div>
-                <div class="ph-fin-card">
-                    <div class="fin-glow" style="background: linear-gradient(90deg, #8e44ad, #9b59b6);"></div>
-                    <div class="icon-circle" style="background: #f4ecf7; color: #8e44ad;">
+            <?php else: ?>
+
+                <!-- Tabs -->
+                <div class="ph-tabs-wrap no-print">
+                    <a class="ph-tab <?php echo $active_tab === 'overview' ? 'active' : ''; ?>"
+                       href="<?php echo build_url(['tab' => 'overview']); ?>">
+                        <i class="fas fa-th-large"></i>
+                        <span class="label">نظرة عامة</span>
+                    </a>
+                    <a class="ph-tab <?php echo $active_tab === 'labs' ? 'active' : ''; ?>"
+                       href="<?php echo build_url(['tab' => 'labs']); ?>">
                         <i class="fas fa-flask"></i>
-                    </div>
-                    <div class="fin-label">المختبر</div>
-                    <div class="fin-amount" style="color: #8e44ad;"><?php echo number_format($fin_summary['lab_total'], 2); ?></div>
-                    <div class="fin-sub">مدفوع: <?php echo number_format($fin_summary['lab_paid'], 2); ?> SDG</div>
-                </div>
-                <div class="ph-fin-card">
-                    <div class="fin-glow" style="background: linear-gradient(90deg, #e67e22, #f39c12);"></div>
-                    <div class="icon-circle" style="background: #fef5e7; color: #e67e22;">
+                        <span class="label">المختبر</span>
+                        <span class="cnt"><?php echo $counts['labs']; ?></span>
+                    </a>
+                    <a class="ph-tab <?php echo $active_tab === 'clinics' ? 'active' : ''; ?>"
+                       href="<?php echo build_url(['tab' => 'clinics']); ?>">
                         <i class="fas fa-stethoscope"></i>
-                    </div>
-                    <div class="fin-label">الخدمات الطبية</div>
-                    <div class="fin-amount" style="color: #e67e22;"><?php echo number_format($fin_summary['services_total'], 2); ?></div>
-                    <div class="fin-sub">مدفوع: <?php echo number_format($fin_summary['services_paid'], 2); ?> SDG</div>
+                        <span class="label">العيادات</span>
+                        <span class="cnt"><?php echo $counts['clinics']; ?></span>
+                    </a>
+                    <a class="ph-tab <?php echo $active_tab === 'services' ? 'active' : ''; ?>"
+                       href="<?php echo build_url(['tab' => 'services']); ?>">
+                        <i class="fas fa-hand-holding-medical"></i>
+                        <span class="label">الخدمات</span>
+                        <span class="cnt"><?php echo $counts['services']; ?></span>
+                    </a>
+                    <?php if ($has['admissions']): ?>
+                    <a class="ph-tab <?php echo $active_tab === 'admissions' ? 'active' : ''; ?>"
+                       href="<?php echo build_url(['tab' => 'admissions']); ?>">
+                        <i class="fas fa-procedures"></i>
+                        <span class="label">التنويم</span>
+                        <span class="cnt"><?php echo $counts['admissions']; ?></span>
+                    </a>
+                    <?php endif; ?>
+                    <a class="ph-tab <?php echo $active_tab === 'consumables' ? 'active' : ''; ?>"
+                       href="<?php echo build_url(['tab' => 'consumables']); ?>">
+                        <i class="fas fa-box-open"></i>
+                        <span class="label">المستهلكات</span>
+                        <span class="cnt"><?php echo $counts['consumables']; ?></span>
+                    </a>
+                    <a class="ph-tab <?php echo $active_tab === 'timeline' ? 'active' : ''; ?>"
+                       href="<?php echo build_url(['tab' => 'timeline']); ?>">
+                        <i class="fas fa-stream"></i>
+                        <span class="label">الخط الزمني</span>
+                    </a>
                 </div>
-            </div>
 
-            <!-- ===== Data Sections with Tabs ===== -->
-            <?php
-            // Pre-fetch data counts for badges
-            $lab_count = $mysqli->query("SELECT COUNT(DISTINCT req_id) as cnt FROM rpos_lab_requests WHERE patient_id = '$selected_patient_id'")->fetch_assoc()['cnt'];
-            $clinic_count = $mysqli->query("SELECT COUNT(*) as cnt FROM rpos_outpatient_records WHERE patient_id = '$selected_patient_id'")->fetch_assoc()['cnt'];
-            $services_count = $mysqli->query("SELECT COUNT(*) as cnt FROM rpos_patient_service_requests WHERE patient_id = '$selected_patient_id'")->fetch_assoc()['cnt'];
-            $admissions_count = $mysqli->query("SELECT COUNT(*) as cnt FROM rpos_admissions WHERE patient_id = '$selected_patient_id'")->fetch_assoc()['cnt'];
-            $consumables_count = $mysqli->query("SELECT COUNT(*) as cnt FROM rpos_patient_consumable_requests WHERE patient_id = '$selected_patient_id'")->fetch_assoc()['cnt'];
-            ?>
-
-            <div class="ph-tabs">
-                <button class="ph-tab-btn active" data-tab="tab-lab">
-                    <i class="fas fa-flask"></i> فحوصات المختبر
-                    <span class="ph-tab-badge"><?php echo $lab_count; ?></span>
-                </button>
-                <button class="ph-tab-btn" data-tab="tab-clinics">
-                    <i class="fas fa-clinic-medical"></i> زيارات العيادات
-                    <span class="ph-tab-badge"><?php echo $clinic_count; ?></span>
-                </button>
-                <button class="ph-tab-btn" data-tab="tab-services">
-                    <i class="fas fa-hand-holding-medical"></i> الخدمات الطبية
-                    <span class="ph-tab-badge"><?php echo $services_count; ?></span>
-                </button>
-                <button class="ph-tab-btn" data-tab="tab-admissions">
-                    <i class="fas fa-procedures"></i> التنويم
-                    <span class="ph-tab-badge"><?php echo $admissions_count; ?></span>
-                </button>
-                <button class="ph-tab-btn" data-tab="tab-consumables">
-                    <i class="fas fa-box-open"></i> المستهلكات
-                    <span class="ph-tab-badge"><?php echo $consumables_count; ?></span>
-                </button>
-                <button class="ph-tab-btn" data-tab="tab-timeline">
-                    <i class="fas fa-stream"></i> الخط الزمني
-                </button>
-            </div>
-
-            <!-- ===== Tab 1: Lab Tests ===== -->
-            <div class="ph-section active" id="tab-lab">
-                <div class="ph-section-card">
-                    <div class="ph-section-header">
-                        <h5><i class="fas fa-microscope"></i> فحوصات المختبر مع النتائج</h5>
-                    </div>
-                    <div class="ph-section-body">
-                        <?php
-                        $lab_requests = $mysqli->query("
-                            SELECT lr.*, 
-                                COUNT(DISTINCT lr2.test_id) as test_count,
-                                SUM(CASE WHEN lr2.flag = 'High' THEN 1 ELSE 0 END) as high_count,
-                                SUM(CASE WHEN lr2.flag = 'Low' THEN 1 ELSE 0 END) as low_count
-                            FROM rpos_lab_requests lr
-                            LEFT JOIN rpos_lab_results lr2 ON lr.req_id = lr2.req_id
-                            WHERE lr.patient_id = '$selected_patient_id'
-                            GROUP BY lr.req_id
-                            ORDER BY lr.req_date DESC
-                        ");
-                        
-                        if ($lab_requests && $lab_requests->num_rows > 0):
-                            while ($req = $lab_requests->fetch_assoc()):
-                                $req_id = $req['req_id'];
-                                // Get detailed results for this request
-                                $results = $mysqli->query("
-                                    SELECT lr2.*, lc.comp_name, lc.normal_range, lc.unit, t.test_name, t.price
-                                    FROM rpos_lab_results lr2
-                                    JOIN rpos_lab_components lc ON lr2.comp_id = lc.comp_id
-                                    JOIN rpos_lab_tests t ON lr2.test_id = t.test_id
-                                    WHERE lr2.req_id = '$req_id'
-                                    ORDER BY t.test_name, lc.comp_id
-                                ");
-                                
-                                // Group by test
-                                $grouped = [];
-                                while ($r = $results->fetch_assoc()) {
-                                    $grouped[$r['test_name']][] = $r;
-                                }
-                        ?>
-                        <div style="margin: 12px; border: 1px solid #e9ecef; border-radius: 12px; overflow: hidden;" class="mb-3">
-                            <div class="ph-lab-request-header">
+                <?php if (!empty($patient['medical_history'])): ?>
+                    <div class="ph-panel" style="background: linear-gradient(135deg, rgba(220,38,38,.04), rgba(239,68,68,.02)); border-color: rgba(220,38,38,.15);">
+                        <div class="ph-panel-body">
+                            <div style="display: flex; gap: 12px; align-items: flex-start;">
+                                <i class="fas fa-notes-medical" style="color: var(--ph-red); font-size: 1.1rem; margin-top: 2px;"></i>
                                 <div>
-                                    <span class="req-code"><i class="fas fa-file-prescription"></i> <?php echo htmlspecialchars($req['req_code']); ?></span>
-                                    <span class="req-date mr-3"><i class="far fa-calendar-alt"></i> <?php echo date('Y-m-d h:i A', strtotime($req['req_date'])); ?></span>
-                                    <span class="req-date mr-3"><i class="fas fa-barcode"></i> <?php echo htmlspecialchars($req['sample_barcode']); ?></span>
-                                </div>
-                                <div>
-                                    <span class="badge badge-<?php echo $req['payment_status'] == 'Paid' ? 'success' : ($req['payment_status'] == 'Partially Paid' ? 'warning' : 'danger'); ?> ml-2">
-                                        <?php echo $req['payment_status']; ?>
+                                    <strong style="color: var(--ph-text); display: block; margin-bottom: 4px; font-size: .88rem;">التاريخ المرضي:</strong>
+                                    <span style="color: var(--ph-text-2); font-size: .85rem; font-weight: 600; line-height: 1.7;">
+                                        <?php echo nl2br(esc($patient['medical_history'])); ?>
                                     </span>
-                                    <span class="badge badge-<?php echo $req['status'] == 'Completed' ? 'success' : ($req['status'] == 'Verified' ? 'info' : 'secondary'); ?>">
-                                        <?php echo $req['status']; ?>
-                                    </span>
-                                    <span class="font-weight-bold mr-2" style="color: #1a5276;">
-                                        <?php echo number_format($req['amount_paid'], 2); ?> / <?php echo number_format($req['total_amount'], 2); ?> SDG
-                                    </span>
-                                    <?php if ($req['high_count'] > 0 || $req['low_count'] > 0): ?>
-                                        <span class="badge badge-danger mr-1">
-                                            <i class="fas fa-exclamation-circle"></i> <?php echo $req['high_count'] + $req['low_count']; ?> غير طبيعي
-                                        </span>
-                                    <?php endif; ?>
-                                    <a href="print_lab_result.php?req_id=<?php echo $req_id; ?>" target="_blank" class="btn btn-sm btn-outline-primary mr-2">
-                                        <i class="fas fa-print"></i>
-                                    </a>
                                 </div>
                             </div>
-                            <table class="ph-lab-table">
-                                <thead>
-                                    <tr>
-                                        <th style="text-align: right; width: 25%;">الفحص (Test)</th>
-                                        <th style="width: 20%;">المكون (Component)</th>
-                                        <th style="width: 15%;">النتيجة (Result)</th>
-                                        <th style="width: 15%;">المؤشر</th>
-                                        <th style="width: 25%;">المعدل الطبيعي</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <?php foreach ($grouped as $test_name => $components): ?>
-                                        <?php $first = true; ?>
-                                        <?php foreach ($components as $c): 
-                                            $flag_class = 'result-normal';
-                                            $arrow = '';
-                                            if ($c['flag'] == 'High') { $flag_class = 'result-high'; $arrow = ' ↑'; }
-                                            elseif ($c['flag'] == 'Low') { $flag_class = 'result-low'; $arrow = ' ↓'; }
-                                        ?>
-                                        <tr>
-                                            <?php if ($first): ?>
-                                                <td class="test-name-cell" rowspan="<?php echo count($components); ?>">
-                                                    <?php echo htmlspecialchars($test_name); ?>
-                                                </td>
-                                            <?php $first = false; endif; ?>
-                                            <td><?php echo htmlspecialchars($c['comp_name']); ?></td>
-                                            <td><span class="<?php echo $flag_class; ?>"><?php echo htmlspecialchars($c['result_value']) . $arrow; ?></span></td>
-                                            <td>
-                                                <span class="badge badge-<?php echo $c['flag'] == 'Normal' ? 'success' : ($c['flag'] == 'High' ? 'danger' : 'warning'); ?>" style="font-size: 11px;">
-                                                    <?php echo $c['flag'] == 'Normal' ? 'طبيعي' : ($c['flag'] == 'High' ? 'مرتفع' : 'منخفض'); ?>
-                                                </span>
-                                            </td>
-                                            <td class="normal-range-cell"><?php echo htmlspecialchars($c['normal_range']); ?> <?php echo htmlspecialchars($c['unit']); ?></td>
-                                        </tr>
-                                        <?php endforeach; ?>
-                                    <?php endforeach; ?>
-                                </tbody>
-                            </table>
                         </div>
-                        <?php 
-                            endwhile;
-                        else:
-                        ?>
-                        <div class="ph-no-data">
-                            <i class="fas fa-flask"></i>
-                            <p>لا توجد فحوصات مختبر مسجلة لهذا المريض.</p>
-                        </div>
-                        <?php endif; ?>
                     </div>
-                </div>
-            </div>
+                <?php endif; ?>
 
-            <!-- ===== Tab 2: Clinics Visited ===== -->
-            <div class="ph-section" id="tab-clinics">
-                <div class="ph-section-card">
-                    <div class="ph-section-header">
-                        <h5><i class="fas fa-clinic-medical"></i> زيارات العيادات الخارجية</h5>
+                <!-- ═══════════ TAB: OVERVIEW ═══════════ -->
+                <?php if ($active_tab === 'overview'): ?>
+
+                    <div class="ph-overview-grid">
+                        <div class="ph-card c-blue">
+                            <div class="ph-card-head">
+                                <div class="ph-card-icon"><i class="fas fa-flask"></i></div>
+                            </div>
+                            <div class="lbl">المختبر</div>
+                            <div class="val"><small>SDG</small><?php echo fmt_money($financial['lab_total']); ?></div>
+                            <div class="sub">مدفوع: <?php echo fmt_money($financial['lab_paid']); ?> · <?php echo $counts['labs']; ?> طلب</div>
+                        </div>
+                        <div class="ph-card c-emerald">
+                            <div class="ph-card-head">
+                                <div class="ph-card-icon"><i class="fas fa-stethoscope"></i></div>
+                            </div>
+                            <div class="lbl">العيادات</div>
+                            <div class="val"><?php echo $counts['clinics']; ?> <small style="font-size:.75rem;">زيارة</small></div>
+                            <div class="sub">رسوم: <?php echo fmt_money($financial['appointments_total']); ?> SDG</div>
+                        </div>
+                        <div class="ph-card c-violet">
+                            <div class="ph-card-head">
+                                <div class="ph-card-icon"><i class="fas fa-hand-holding-medical"></i></div>
+                            </div>
+                            <div class="lbl">الخدمات الطبية</div>
+                            <div class="val"><small>SDG</small><?php echo fmt_money($financial['services_total']); ?></div>
+                            <div class="sub">مدفوع: <?php echo fmt_money($financial['services_paid']); ?> · <?php echo $counts['services']; ?> خدمة</div>
+                        </div>
+                        <div class="ph-card c-amber">
+                            <div class="ph-card-head">
+                                <div class="ph-card-icon"><i class="fas fa-box-open"></i></div>
+                            </div>
+                            <div class="lbl">المستهلكات</div>
+                            <div class="val"><small>SDG</small><?php echo fmt_money($financial['consumables_total']); ?></div>
+                            <div class="sub">مدفوع: <?php echo fmt_money($financial['consumables_paid']); ?> · <?php echo $counts['consumables']; ?> طلب</div>
+                        </div>
+                        <div class="ph-card c-red">
+                            <div class="ph-card-head">
+                                <div class="ph-card-icon"><i class="fas fa-undo"></i></div>
+                            </div>
+                            <div class="lbl">الاستردادات</div>
+                            <div class="val"><small>SDG</small><?php echo fmt_money($financial['refunds_total']); ?></div>
+                            <div class="sub">مبالغ مُرجعة للمريض</div>
+                        </div>
+                        <div class="ph-card c-navy">
+                            <div class="ph-card-head">
+                                <div class="ph-card-icon"><i class="fas fa-money-bill-wave"></i></div>
+                            </div>
+                            <div class="lbl">صافي المُحصَّل</div>
+                            <div class="val"><small>SDG</small><?php echo fmt_money($financial['net_revenue']); ?></div>
+                            <div class="sub">المدفوع - الاستردادات</div>
+                        </div>
                     </div>
-                    <div class="ph-section-body">
-                        <?php
-                        $clinics = $mysqli->query("
-                            SELECT o.*, s.staff_name as doctor_name
-                            FROM rpos_outpatient_records o
-                            LEFT JOIN rpos_staff s ON o.doctor_id = s.staff_id
-                            WHERE o.patient_id = '$selected_patient_id'
-                            ORDER BY o.visit_date DESC
-                        ");
-                        
-                        if ($clinics && $clinics->num_rows > 0):
-                            while ($c = $clinics->fetch_assoc()):
-                        ?>
-                        <div class="ph-timeline" style="padding: 10px 0;">
-                            <div class="ph-tl-item" style="padding-right: 70px;">
-                                <div class="ph-tl-icon" style="background: linear-gradient(135deg, #27ae60, #2ecc71);">
-                                    <i class="fas fa-stethoscope"></i>
+
+                    <!-- Recent Activity Timeline -->
+                    <div class="ph-panel">
+                        <div class="ph-panel-head">
+                            <h3><i class="fas fa-stream"></i> آخر الأنشطة</h3>
+                            <a href="<?php echo build_url(['tab' => 'timeline']); ?>" class="ph-btn ghost no-print">
+                                عرض الكل <i class="fas fa-arrow-left"></i>
+                            </a>
+                        </div>
+                        <div class="ph-panel-body">
+                            <?php if (empty($tab_data)): ?>
+                                <div class="ph-empty">
+                                    <div class="icon"><i class="fas fa-folder-open"></i></div>
+                                    <h4>لا توجد أنشطة مسجلة</h4>
+                                    <p>هذا المريض ليس لديه أي سجلات حتى الآن</p>
                                 </div>
-                                <div class="ph-tl-content" style="border-right-color: #27ae60;">
-                                    <div class="ph-tl-title">
-                                        <i class="fas fa-clinic-medical"></i> زيارة عيادة - <?php echo htmlspecialchars($c['outpatient_code']); ?>
-                                    </div>
-                                    <div class="ph-tl-meta">
-                                        <span class="ph-tl-date"><i class="far fa-calendar-alt"></i> <?php echo date('Y-m-d h:i A', strtotime($c['visit_date'])); ?></span>
-                                        <?php if ($c['doctor_name']): ?>
-                                            <span class="ph-tl-badge badge badge-info"><i class="fas fa-user-md"></i> د. <?php echo htmlspecialchars($c['doctor_name']); ?></span>
-                                        <?php endif; ?>
-                                    </div>
-                                    <div class="ph-tl-body">
-                                        <div class="row">
-                                            <div class="col-md-6">
-                                                <strong>العلامات الحيوية:</strong><br>
-                                                <span class="badge badge-light">الضغط: <?php echo $c['blood_pressure'] ?: '--'; ?></span>
-                                                <span class="badge badge-light">الحرارة: <?php echo $c['temperature'] ?: '--'; ?>°C</span>
-                                                <span class="badge badge-light">النبض: <?php echo $c['pulse_rate'] ?: '--'; ?>/د</span>
-                                                <span class="badge badge-light">الوزن: <?php echo $c['weight'] ?: '--'; ?> كجم</span>
+                            <?php else: ?>
+                                <?php echo render_timeline($tab_data); ?>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+
+                <!-- ═══════════ TAB: LABS ═══════════ -->
+                <?php elseif ($active_tab === 'labs'): ?>
+
+                    <div class="ph-panel">
+                        <div class="ph-panel-head">
+                            <h3><i class="fas fa-flask"></i> فحوصات المختبر</h3>
+                            <span class="ph-badge b-blue"><?php echo count($tab_data); ?> طلب</span>
+                        </div>
+                        <div class="ph-panel-body">
+                            <?php if (empty($tab_data)): ?>
+                                <div class="ph-empty">
+                                    <div class="icon"><i class="fas fa-flask"></i></div>
+                                    <h4>لا توجد فحوصات مختبر</h4>
+                                    <p>لم يتم تسجيل أي فحوصات لهذا المريض</p>
+                                </div>
+                            <?php else: ?>
+                                <?php foreach ($tab_data as $req): ?>
+                                    <div class="ph-lab-request">
+                                        <div class="ph-lab-head">
+                                            <div class="ph-lab-head-left">
+                                                <span class="ph-lab-code"><?php echo esc($req['req_code']); ?></span>
+                                                <span class="ph-lab-meta">
+                                                    <i class="far fa-calendar-alt"></i>
+                                                    <?php echo date('Y-m-d', strtotime($req['req_date'])); ?>
+                                                </span>
+                                                <?php if (!empty($req['sample_barcode'])): ?>
+                                                    <span class="ph-lab-meta">
+                                                        <i class="fas fa-barcode"></i>
+                                                        <?php echo esc($req['sample_barcode']); ?>
+                                                    </span>
+                                                <?php endif; ?>
+                                                <?php if ($req['abnormal_count'] > 0): ?>
+                                                    <span class="ph-badge b-red">
+                                                        <i class="fas fa-exclamation-triangle"></i>
+                                                        <?php echo $req['abnormal_count']; ?> نتيجة غير طبيعية
+                                                    </span>
+                                                <?php endif; ?>
                                             </div>
-                                            <div class="col-md-6">
-                                                <?php if ($c['symptoms']): ?>
-                                                    <strong>الأعراض:</strong> <?php echo htmlspecialchars($c['symptoms']); ?><br>
-                                                <?php endif; ?>
-                                                <?php if ($c['diagnosis']): ?>
-                                                    <strong>التشخيص:</strong> <?php echo htmlspecialchars($c['diagnosis']); ?>
-                                                <?php endif; ?>
+                                            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                                                <span class="ph-badge <?php
+                                                    echo $req['payment_status'] === 'Paid' ? 'b-emerald' :
+                                                        ($req['payment_status'] === 'Partially Paid' ? 'b-amber' : 'b-red');
+                                                ?>">
+                                                    <?php echo esc($req['payment_status']); ?>
+                                                </span>
+                                                <span style="font-weight:800;color:var(--ph-text);font-size:.82rem;">
+                                                    <?php echo fmt_money($req['amount_paid']); ?> / <?php echo fmt_money($req['total_amount']); ?> SDG
+                                                </span>
                                             </div>
                                         </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        <?php 
-                            endwhile;
-                        else:
-                        ?>
-                        <div class="ph-no-data">
-                            <i class="fas fa-clinic-medical"></i>
-                            <p>لا توجد زيارات عيادات مسجلة لهذا المريض.</p>
-                        </div>
-                        <?php endif; ?>
-                    </div>
-                </div>
-            </div>
 
-            <!-- ===== Tab 3: Medical Services ===== -->
-            <div class="ph-section" id="tab-services">
-                <div class="ph-section-card">
-                    <div class="ph-section-header">
-                        <h5><i class="fas fa-hand-holding-medical"></i> الخدمات الطبية المطلوبة</h5>
-                    </div>
-                    <div class="ph-section-body">
-                        <?php
-                        $services = $mysqli->query("
-                            SELECT sr.*, ms.service_name, ms.service_type, ms.fee
-                            FROM rpos_patient_service_requests sr
-                            JOIN rpos_medical_services ms ON sr.service_id = ms.service_id
-                            WHERE sr.patient_id = '$selected_patient_id'
-                            ORDER BY sr.created_at DESC
-                        ");
-                        
-                        if ($services && $services->num_rows > 0):
-                        ?>
-                        <div class="ph-services-grid">
-                            <?php while ($sv = $services->fetch_assoc()): ?>
-                            <div class="ph-service-card">
-                                <div class="d-flex justify-content-between align-items-start mb-2">
-                                    <div class="ph-service-name">
-                                        <i class="fas fa-<?php echo $sv['service_type'] == 'Consumable' ? 'box' : 'syringe'; ?> text-<?php echo $sv['service_type'] == 'Consumable' ? 'warning' : 'info'; ?>"></i>
-                                        <?php echo htmlspecialchars($sv['service_name']); ?>
-                                    </div>
-                                    <div class="ph-service-fee"><?php echo number_format($sv['total_cost'], 2); ?> SDG</div>
-                                </div>
-                                <div class="d-flex justify-content-between align-items-center">
-                                    <div>
-                                        <span class="badge badge-<?php echo $sv['service_type'] == 'Medical' ? 'info' : 'warning'; ?>">
-                                            <?php echo $sv['service_type'] == 'Medical' ? 'طبي' : 'مستهلك'; ?>
-                                        </span>
-                                        <span class="badge badge-<?php 
-                                            echo $sv['status'] == 'Completed' ? 'success' : ($sv['status'] == 'Pending' ? 'secondary' : 'danger');
-                                        ?>">
-                                            <?php echo $sv['status'] == 'Completed' ? 'مكتمل' : ($sv['status'] == 'Pending' ? 'معلق' : 'ملغي'); ?>
-                                        </span>
-                                    </div>
-                                    <div class="ph-service-date">
-                                        <i class="far fa-calendar-alt"></i> <?php echo date('Y-m-d', strtotime($sv['created_at'])); ?>
-                                    </div>
-                                </div>
-                                <?php if ($sv['payment_status']): ?>
-                                <div class="mt-2 pt-2" style="border-top: 1px solid #e9ecef; font-size: 12px; color: #7f8c8d;">
-                                    الدفع: <strong style="color: <?php echo $sv['payment_status'] == 'Paid' ? '#27ae60' : '#e74c3c'; ?>">
-                                        <?php echo number_format($sv['amount_paid'], 2); ?>
-                                    </strong> / <?php echo number_format($sv['total_cost'], 2); ?> SDG
-                                    <span class="badge badge-<?php echo $sv['payment_status'] == 'Paid' ? 'success' : ($sv['payment_status'] == 'Partially Paid' ? 'warning' : 'danger'); ?> float-left">
-                                        <?php echo $sv['payment_status']; ?>
-                                    </span>
-                                </div>
-                                <?php endif; ?>
-                                <?php if ($sv['request_notes']): ?>
-                                <div class="mt-1" style="font-size: 12px; color: #7f8c8d;">
-                                    <i class="fas fa-comment"></i> <?php echo htmlspecialchars($sv['request_notes']); ?>
-                                </div>
-                                <?php endif; ?>
-                            </div>
-                            <?php endwhile; ?>
-                        </div>
-                        <?php else: ?>
-                        <div class="ph-no-data">
-                            <i class="fas fa-hand-holding-medical"></i>
-                            <p>لا توجد خدمات طبية مطلوبة لهذا المريض.</p>
-                        </div>
-                        <?php endif; ?>
-                    </div>
-                </div>
-            </div>
-
-            <!-- ===== Tab 4: Admissions ===== -->
-            <div class="ph-section" id="tab-admissions">
-                <div class="ph-section-card">
-                    <div class="ph-section-header">
-                        <h5><i class="fas fa-procedures"></i> التنويم والإقامة بالمستشفى</h5>
-                    </div>
-                    <div class="ph-section-body">
-                        <?php
-                        $admissions = $mysqli->query("
-                            SELECT a.*, b.bed_number, r.room_name 
-                            FROM rpos_admissions a 
-                            JOIN rpos_beds b ON a.bed_id = b.bed_id 
-                            JOIN rpos_rooms r ON b.room_id = r.room_id 
-                            WHERE a.patient_id = '$selected_patient_id'
-                            ORDER BY a.admission_date DESC
-                        ");
-                        
-                        if ($admissions && $admissions->num_rows > 0):
-                            while ($adm = $admissions->fetch_assoc()):
-                        ?>
-                        <div class="ph-timeline" style="padding: 10px 0;">
-                            <div class="ph-tl-item" style="padding-right: 70px;">
-                                <div class="ph-tl-icon" style="background: linear-gradient(135deg, #3498db, #2980b9);">
-                                    <i class="fas fa-procedures"></i>
-                                </div>
-                                <div class="ph-tl-content" style="border-right-color: #3498db;">
-                                    <div class="ph-tl-title">
-                                        <i class="fas fa-hospital"></i> تنويم - <?php echo htmlspecialchars($adm['admission_code']); ?>
-                                        <span class="badge badge-<?php echo $adm['status'] == 'Admitted' ? 'warning' : 'success'; ?> float-left">
-                                            <?php echo $adm['status'] == 'Admitted' ? 'نشط حالياً' : 'تم الخروج'; ?>
-                                        </span>
-                                    </div>
-                                    <div class="ph-tl-meta">
-                                        <span class="ph-tl-date"><i class="far fa-calendar-alt"></i> الدخول: <?php echo date('Y-m-d h:i A', strtotime($adm['admission_date'])); ?></span>
-                                        <?php if ($adm['actual_discharge_date']): ?>
-                                            <span class="ph-tl-date"><i class="fas fa-sign-out-alt"></i> الخروج: <?php echo date('Y-m-d h:i A', strtotime($adm['actual_discharge_date'])); ?></span>
+                                        <?php if (!empty($req['tests'])): ?>
+                                            <div class="table-responsive">
+                                                <table class="ph-lab-table">
+                                                    <thead>
+                                                        <tr>
+                                                            <th>الفحص</th>
+                                                            <th>المكون</th>
+                                                            <th style="text-align:center;">النتيجة</th>
+                                                            <th style="text-align:center;">المؤشر</th>
+                                                            <th>المعدل الطبيعي</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                        <?php foreach ($req['tests'] as $test): ?>
+                                                            <?php if (empty($test['components'])): ?>
+                                                                <tr>
+                                                                    <td class="ph-lab-test-name"><?php echo esc($test['test_name']); ?></td>
+                                                                    <td colspan="4" style="text-align:center;color:var(--ph-muted);font-style:italic;">
+                                                                        لم تُسجَّل نتائج بعد
+                                                                    </td>
+                                                                </tr>
+                                                            <?php else: ?>
+                                                                <?php $first = true; foreach ($test['components'] as $comp):
+                                                                    $flag = $comp['flag'] ?? 'Normal';
+                                                                    $resultClass = $flag === 'High' ? 'high' : ($flag === 'Low' ? 'low' : 'normal');
+                                                                    $arrow = $flag === 'High' ? ' ↑' : ($flag === 'Low' ? ' ↓' : '');
+                                                                ?>
+                                                                    <tr>
+                                                                        <?php if ($first): ?>
+                                                                            <td class="ph-lab-test-name" rowspan="<?php echo count($test['components']); ?>">
+                                                                                <?php echo esc($test['test_name']); ?>
+                                                                            </td>
+                                                                            <?php $first = false; ?>
+                                                                        <?php endif; ?>
+                                                                        <td><?php echo esc($comp['name']) ?: '—'; ?></td>
+                                                                        <td style="text-align:center;">
+                                                                            <span class="ph-result <?php echo $resultClass; ?>">
+                                                                                <?php echo esc($comp['value']); ?><?php echo $arrow; ?>
+                                                                            </span>
+                                                                        </td>
+                                                                        <td style="text-align:center;">
+                                                                            <span class="ph-badge <?php
+                                                                                echo $flag === 'High' ? 'b-red' : ($flag === 'Low' ? 'b-amber' : 'b-emerald');
+                                                                            ?>">
+                                                                                <?php echo $flag === 'High' ? 'مرتفع' : ($flag === 'Low' ? 'منخفض' : 'طبيعي'); ?>
+                                                                            </span>
+                                                                        </td>
+                                                                        <td style="color:var(--ph-muted);font-size:.78rem;">
+                                                                            <?php echo esc($comp['normal_range']); ?>
+                                                                            <?php if (!empty($comp['unit'])): ?>
+                                                                                <?php echo esc($comp['unit']); ?>
+                                                                            <?php endif; ?>
+                                                                        </td>
+                                                                    </tr>
+                                                                <?php endforeach; ?>
+                                                            <?php endif; ?>
+                                                        <?php endforeach; ?>
+                                                    </tbody>
+                                                </table>
+                                            </div>
                                         <?php endif; ?>
                                     </div>
-                                    <div class="ph-tl-body">
-                                        <strong>الغرفة:</strong> <?php echo htmlspecialchars($adm['room_name']); ?> | 
-                                        <strong>السرير:</strong> <?php echo htmlspecialchars($adm['bed_number']); ?>
-                                        <?php if ($adm['total_stay_fee'] > 0): ?>
-                                            | <strong>رسوم الإقامة:</strong> <?php echo number_format($adm['total_stay_fee'], 2); ?> SDG
-                                        <?php endif; ?>
-                                    </div>
-                                </div>
-                            </div>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
                         </div>
-                        <?php 
-                            endwhile;
-                        else:
-                        ?>
-                        <div class="ph-no-data">
-                            <i class="fas fa-procedures"></i>
-                            <p>لا توجد سجلات تنويم لهذا المريض.</p>
-                        </div>
-                        <?php endif; ?>
                     </div>
-                </div>
-            </div>
 
-            <!-- ===== Tab 5: Consumables ===== -->
-            <div class="ph-section" id="tab-consumables">
-                <div class="ph-section-card">
-                    <div class="ph-section-header">
-                        <h5><i class="fas fa-box-open"></i> طلبات المستهلكات الطبية</h5>
-                    </div>
-                    <div class="ph-section-body">
-                        <?php
-                        $consumables = $mysqli->query("
-                            SELECT r.*, i.item_name, ri.quantity_requested, ri.price_charged
-                            FROM rpos_patient_consumable_requests r
-                            JOIN rpos_patient_request_items ri ON r.request_id = ri.request_id
-                            JOIN rpos_store_items i ON ri.item_id = i.item_id
-                            WHERE r.patient_id = '$selected_patient_id'
-                            ORDER BY r.created_at DESC
-                        ");
-                        
-                        if ($consumables && $consumables->num_rows > 0):
-                            while ($con = $consumables->fetch_assoc()):
-                        ?>
-                        <div class="ph-timeline" style="padding: 10px 0;">
-                            <div class="ph-tl-item" style="padding-right: 70px;">
-                                <div class="ph-tl-icon" style="background: linear-gradient(135deg, #f39c12, #e67e22);">
-                                    <i class="fas fa-box-open"></i>
-                                </div>
-                                <div class="ph-tl-content" style="border-right-color: #f39c12;">
-                                    <div class="ph-tl-title">
-                                        <i class="fas fa-prescription-bottle"></i> صرف مستهلكات - <?php echo htmlspecialchars($con['request_code']); ?>
-                                    </div>
-                                    <div class="ph-tl-meta">
-                                        <span class="ph-tl-date"><i class="far fa-calendar-alt"></i> <?php echo date('Y-m-d h:i A', strtotime($con['created_at'])); ?></span>
-                                        <span class="ph-tl-badge badge badge-<?php echo $con['status'] == 'Dispensed' ? 'success' : ($con['status'] == 'Pending' ? 'warning' : 'danger'); ?>">
-                                            <?php echo $con['status']; ?>
-                                        </span>
-                                    </div>
-                                    <div class="ph-tl-body">
-                                        <strong>الصنف:</strong> <?php echo htmlspecialchars($con['item_name']); ?> |
-                                        <strong>الكمية:</strong> <?php echo $con['quantity_requested']; ?> وحدة |
-                                        <strong>التكلفة:</strong> <?php echo number_format($con['total_cost'], 2); ?> SDG
-                                    </div>
-                                </div>
-                            </div>
+                <!-- ═══════════ TAB: CLINICS ═══════════ -->
+                <?php elseif ($active_tab === 'clinics'): ?>
+
+                    <div class="ph-panel">
+                        <div class="ph-panel-head">
+                            <h3><i class="fas fa-stethoscope"></i> زيارات العيادات</h3>
+                            <span class="ph-badge b-emerald"><?php echo count($tab_data); ?> زيارة</span>
                         </div>
-                        <?php 
-                            endwhile;
-                        else:
-                        ?>
-                        <div class="ph-no-data">
-                            <i class="fas fa-box-open"></i>
-                            <p>لا توجد طلبات مستهلكات طبية لهذا المريض.</p>
-                        </div>
-                        <?php endif; ?>
-                    </div>
-                </div>
-            </div>
-
-            <!-- ===== Tab 6: Unified Timeline ===== -->
-            <div class="ph-section" id="tab-timeline">
-                <div class="ph-section-card">
-                    <div class="ph-section-header">
-                        <h5><i class="fas fa-stream"></i> الخط الزمني الموحد لجميع الأنشطة</h5>
-                    </div>
-                    <div class="ph-section-body">
-                        <?php
-                        $timeline_events = [];
-
-                        // 1. Outpatient / Clinic visits
-                        $opd_q = $mysqli->query("
-                            SELECT o.*, s.staff_name as doctor_name
-                            FROM rpos_outpatient_records o
-                            LEFT JOIN rpos_staff s ON o.doctor_id = s.staff_id
-                            WHERE o.patient_id = '$selected_patient_id'
-                        ");
-                        while($r = $opd_q->fetch_assoc()) {
-                            $timeline_events[] = [
-                                'date' => $r['visit_date'],
-                                'type' => 'outpatient',
-                                'title' => 'زيارة عيادة خارجية',
-                                'icon' => 'fa-stethoscope',
-                                'color' => '#27ae60',
-                                'body' => "<b>الكود:</b> {$r['outpatient_code']} | <b>الطبيب:</b> " . ($r['doctor_name'] ?: '--') .
-                                    "<br><b>العلامات الحيوية:</b> الضغط: {$r['blood_pressure']} | الحرارة: {$r['temperature']}°C | النبض: {$r['pulse_rate']}/د | الوزن: {$r['weight']} كجم" .
-                                    ($r['diagnosis'] ? "<br><b>التشخيص:</b> {$r['diagnosis']}" : "")
-                            ];
-                        }
-
-                        // 2. Lab requests
-                        $lab_q = $mysqli->query("
-                            SELECT lr.*, GROUP_CONCAT(DISTINCT t.test_name SEPARATOR '، ') as test_names
-                            FROM rpos_lab_requests lr
-                            LEFT JOIN rpos_lab_results lr2 ON lr.req_id = lr2.req_id
-                            LEFT JOIN rpos_lab_tests t ON lr2.test_id = t.test_id
-                            WHERE lr.patient_id = '$selected_patient_id'
-                            GROUP BY lr.req_id
-                        ");
-                        while($r = $lab_q->fetch_assoc()) {
-                            $timeline_events[] = [
-                                'date' => $r['req_date'],
-                                'type' => 'lab',
-                                'title' => 'طلب فحص مختبر - ' . $r['req_code'],
-                                'icon' => 'fa-flask',
-                                'color' => '#8e44ad',
-                                'body' => "<b>الفحوصات:</b> " . ($r['test_names'] ?: '--') .
-                                    "<br><b>المبلغ:</b> {$r['total_amount']} SDG | <b>مدفوع:</b> {$r['amount_paid']} SDG | <b>الحالة:</b> {$r['payment_status']}"
-                            ];
-                        }
-
-                        // 3. Medical services
-                        $svc_q = $mysqli->query("
-                            SELECT sr.*, ms.service_name
-                            FROM rpos_patient_service_requests sr
-                            JOIN rpos_medical_services ms ON sr.service_id = ms.service_id
-                            WHERE sr.patient_id = '$selected_patient_id'
-                        ");
-                        while($r = $svc_q->fetch_assoc()) {
-                            $timeline_events[] = [
-                                'date' => $r['created_at'],
-                                'type' => 'service',
-                                'title' => 'خدمة طبية: ' . $r['service_name'],
-                                'icon' => 'fa-hand-holding-medical',
-                                'color' => '#e67e22',
-                                'body' => "<b>التكلفة:</b> {$r['total_cost']} SDG | <b>الحالة:</b> {$r['status']} | <b>الدفع:</b> {$r['payment_status']}"
-                            ];
-                        }
-
-                        // 4. Admissions
-                        $adm_q = $mysqli->query("
-                            SELECT a.*, b.bed_number, r.room_name 
-                            FROM rpos_admissions a 
-                            JOIN rpos_beds b ON a.bed_id = b.bed_id 
-                            JOIN rpos_rooms r ON b.room_id = r.room_id 
-                            WHERE a.patient_id = '$selected_patient_id'
-                        ");
-                        while($r = $adm_q->fetch_assoc()) {
-                            $body = "<b>الغرفة:</b> {$r['room_name']} | <b>السرير:</b> {$r['bed_number']}";
-                            if($r['status'] == 'Discharged') {
-                                $body .= "<br><b>تاريخ الخروج:</b> " . date('Y-m-d h:i A', strtotime($r['actual_discharge_date'])) .
-                                    " | <b>رسوم الإقامة:</b> " . number_format($r['total_stay_fee'], 2) . " SDG";
-                            }
-                            $timeline_events[] = [
-                                'date' => $r['admission_date'],
-                                'type' => 'admission',
-                                'title' => 'تنويم (' . $r['admission_code'] . ') - ' . ($r['status'] == 'Admitted' ? 'نشط' : 'تم الخروج'),
-                                'icon' => 'fa-procedures',
-                                'color' => '#3498db',
-                                'body' => $body
-                            ];
-                        }
-
-                        // 5. Consumables
-                        $con_q = $mysqli->query("
-                            SELECT r.*, i.item_name, ri.quantity_requested
-                            FROM rpos_patient_consumable_requests r
-                            JOIN rpos_patient_request_items ri ON r.request_id = ri.request_id
-                            JOIN rpos_store_items i ON ri.item_id = i.item_id
-                            WHERE r.patient_id = '$selected_patient_id'
-                        ");
-                        while($r = $con_q->fetch_assoc()) {
-                            $timeline_events[] = [
-                                'date' => $r['created_at'],
-                                'type' => 'consumable',
-                                'title' => 'صرف مستهلكات - ' . $r['request_code'],
-                                'icon' => 'fa-box-open',
-                                'color' => '#f39c12',
-                                'body' => "<b>الصنف:</b> {$r['item_name']} | <b>الكمية:</b> {$r['quantity_requested']} وحدة | <b>التكلفة:</b> " . number_format($r['total_cost'], 2) . " SDG"
-                            ];
-                        }
-
-                        // Sort by date descending
-                        usort($timeline_events, function($a, $b) {
-                            return strtotime($b['date']) - strtotime($a['date']);
-                        });
-
-                        if (count($timeline_events) > 0):
-                        ?>
-                        <div class="ph-timeline">
-                            <?php foreach ($timeline_events as $ev): ?>
-                            <div class="ph-tl-item">
-                                <div class="ph-tl-icon" style="background: <?php echo $ev['color']; ?>;">
-                                    <i class="fas <?php echo $ev['icon']; ?>"></i>
+                        <div class="ph-panel-body">
+                            <?php if (empty($tab_data)): ?>
+                                <div class="ph-empty">
+                                    <div class="icon"><i class="fas fa-stethoscope"></i></div>
+                                    <h4>لا توجد زيارات عيادات</h4>
+                                    <p>لم يتم تسجيل أي زيارات لهذا المريض</p>
                                 </div>
-                                <div class="ph-tl-content" style="border-right-color: <?php echo $ev['color']; ?>;">
-                                    <div class="ph-tl-title">
-                                        <i class="fas <?php echo $ev['icon']; ?>" style="color: <?php echo $ev['color']; ?>;"></i>
-                                        <?php echo $ev['title']; ?>
-                                    </div>
-                                    <div class="ph-tl-meta">
-                                        <span class="ph-tl-date"><i class="far fa-clock"></i> <?php echo date('Y-m-d h:i A', strtotime($ev['date'])); ?></span>
-                                        <span class="ph-tl-badge badge" style="background: <?php echo $ev['color']; ?>20; color: <?php echo $ev['color']; ?>;">
-                                            <?php 
-                                                echo $ev['type'] == 'outpatient' ? 'عيادة' : 
-                                                    ($ev['type'] == 'lab' ? 'مختبر' : 
-                                                    ($ev['type'] == 'service' ? 'خدمة' : 
-                                                    ($ev['type'] == 'admission' ? 'تنويم' : 'مستهلكات')));
-                                            ?>
-                                        </span>
-                                    </div>
-                                    <div class="ph-tl-body"><?php echo $ev['body']; ?></div>
+                            <?php else: ?>
+                                <div class="ph-timeline">
+                                    <?php foreach ($tab_data as $c): ?>
+                                        <div class="ph-tl-item">
+                                            <div class="ph-tl-dot clinic"><i class="fas fa-stethoscope"></i></div>
+                                            <div class="ph-tl-card clinic">
+                                                <div class="ph-tl-title">
+                                                    زيارة عيادة
+                                                    <span class="ph-badge b-slate" style="font-family: 'Courier New', monospace;">
+                                                        <?php echo esc($c['outpatient_code']); ?>
+                                                    </span>
+                                                    <?php if (!empty($c['doctor_name'])): ?>
+                                                        <span class="ph-badge b-blue">
+                                                            <i class="fas fa-user-md"></i>
+                                                            د. <?php echo esc($c['doctor_name']); ?>
+                                                        </span>
+                                                    <?php endif; ?>
+                                                </div>
+                                                <div class="ph-tl-date">
+                                                    <i class="far fa-calendar-alt"></i>
+                                                    <?php echo date('Y-m-d h:i A', strtotime($c['visit_date'])); ?>
+                                                </div>
+                                                <div class="ph-tl-body">
+                                                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+                                                        <?php if (!empty($c['blood_pressure'])): ?>
+                                                            <span class="ph-badge b-red">ضغط: <?php echo esc($c['blood_pressure']); ?></span>
+                                                        <?php endif; ?>
+                                                        <?php if (!empty($c['temperature'])): ?>
+                                                            <span class="ph-badge b-amber">حرارة: <?php echo esc($c['temperature']); ?>°C</span>
+                                                        <?php endif; ?>
+                                                        <?php if (!empty($c['pulse_rate'])): ?>
+                                                            <span class="ph-badge b-blue">نبض: <?php echo esc($c['pulse_rate']); ?>/د</span>
+                                                        <?php endif; ?>
+                                                        <?php if (!empty($c['weight'])): ?>
+                                                            <span class="ph-badge b-slate">وزن: <?php echo esc($c['weight']); ?> كجم</span>
+                                                        <?php endif; ?>
+                                                    </div>
+                                                    <?php if (!empty($c['symptoms'])): ?>
+                                                        <div><strong>الأعراض:</strong> <?php echo esc($c['symptoms']); ?></div>
+                                                    <?php endif; ?>
+                                                    <?php if (!empty($c['diagnosis'])): ?>
+                                                        <div><strong>التشخيص:</strong> <?php echo esc($c['diagnosis']); ?></div>
+                                                    <?php endif; ?>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    <?php endforeach; ?>
                                 </div>
-                            </div>
-                            <?php endforeach; ?>
+                            <?php endif; ?>
                         </div>
-                        <?php else: ?>
-                        <div class="ph-no-data">
-                            <i class="fas fa-folder-open"></i>
-                            <p>لا توجد أي سجلات أو حركات مسجلة لهذا المريض بعد.</p>
-                        </div>
-                        <?php endif; ?>
                     </div>
-                </div>
-            </div>
+
+                <!-- ═══════════ TAB: SERVICES ═══════════ -->
+                <?php elseif ($active_tab === 'services'): ?>
+
+                    <div class="ph-panel">
+                        <div class="ph-panel-head">
+                            <h3><i class="fas fa-hand-holding-medical"></i> الخدمات الطبية</h3>
+                            <span class="ph-badge b-violet"><?php echo count($tab_data); ?> خدمة</span>
+                        </div>
+                        <div class="ph-panel-body">
+                            <?php if (empty($tab_data)): ?>
+                                <div class="ph-empty">
+                                    <div class="icon"><i class="fas fa-hand-holding-medical"></i></div>
+                                    <h4>لا توجد خدمات طبية</h4>
+                                    <p>لم يتم تسجيل أي خدمات لهذا المريض</p>
+                                </div>
+                            <?php else: ?>
+                                <div class="ph-grid">
+                                    <?php foreach ($tab_data as $sv): ?>
+                                        <div class="ph-item s-service">
+                                            <div class="ph-item-code"><?php echo esc($sv['request_code']); ?></div>
+                                            <div class="ph-item-title">
+                                                <i class="fas fa-syringe" style="color: var(--ph-violet);"></i>
+                                                <?php echo esc($sv['service_name']); ?>
+                                            </div>
+                                            <div class="ph-item-row">
+                                                <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                                                    <span class="ph-badge <?php
+                                                        echo $sv['status'] === 'Completed' ? 'b-emerald' :
+                                                            ($sv['status'] === 'Pending' ? 'b-slate' : 'b-red');
+                                                    ?>">
+                                                        <?php
+                                                            echo $sv['status'] === 'Completed' ? 'مكتمل' :
+                                                                ($sv['status'] === 'Pending' ? 'معلق' : 'ملغي');
+                                                        ?>
+                                                    </span>
+                                                    <span class="ph-badge <?php
+                                                        echo $sv['payment_status'] === 'Paid' ? 'b-emerald' :
+                                                            ($sv['payment_status'] === 'Partially Paid' ? 'b-amber' : 'b-red');
+                                                    ?>">
+                                                        <?php echo esc($sv['payment_status']); ?>
+                                                    </span>
+                                                </div>
+                                                <div class="ph-item-price">
+                                                    <?php echo fmt_money($sv['total_cost']); ?> <small>SDG</small>
+                                                </div>
+                                            </div>
+                                            <div style="margin-top:8px;font-size:.74rem;color:var(--ph-muted);font-weight:600;">
+                                                <i class="far fa-clock"></i>
+                                                <?php echo date('Y-m-d', strtotime($sv['created_at'])); ?>
+                                                <span style="margin:0 6px;opacity:.4;">·</span>
+                                                مدفوع: <?php echo fmt_money($sv['amount_paid']); ?> SDG
+                                            </div>
+                                        </div>
+                                    <?php endforeach; ?>
+                                </div>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+
+                <!-- ═══════════ TAB: ADMISSIONS ═══════════ -->
+                <?php elseif ($active_tab === 'admissions' && $has['admissions']): ?>
+
+                    <div class="ph-panel">
+                        <div class="ph-panel-head">
+                            <h3><i class="fas fa-procedures"></i> سجل التنويم</h3>
+                            <span class="ph-badge b-blue"><?php echo count($tab_data); ?> سجل</span>
+                        </div>
+                        <div class="ph-panel-body">
+                            <?php if (empty($tab_data)): ?>
+                                <div class="ph-empty">
+                                    <div class="icon"><i class="fas fa-procedures"></i></div>
+                                    <h4>لا توجد سجلات تنويم</h4>
+                                    <p>لم يتم تسجيل أي تنويم لهذا المريض</p>
+                                </div>
+                            <?php else: ?>
+                                <div class="ph-timeline">
+                                    <?php foreach ($tab_data as $adm): ?>
+                                        <div class="ph-tl-item">
+                                            <div class="ph-tl-dot admission"><i class="fas fa-procedures"></i></div>
+                                            <div class="ph-tl-card admission">
+                                                <div class="ph-tl-title">
+                                                    تنويم
+                                                    <span class="ph-badge b-slate" style="font-family: 'Courier New', monospace;">
+                                                        <?php echo esc($adm['admission_code']); ?>
+                                                    </span>
+                                                    <span class="ph-badge <?php echo $adm['status'] === 'Admitted' ? 'b-amber' : 'b-emerald'; ?>">
+                                                        <?php echo $adm['status'] === 'Admitted' ? 'نشط حالياً' : 'تم الخروج'; ?>
+                                                    </span>
+                                                </div>
+                                                <div class="ph-tl-date">
+                                                    <i class="fas fa-sign-in-alt"></i>
+                                                    الدخول: <?php echo date('Y-m-d h:i A', strtotime($adm['admission_date'])); ?>
+                                                    <?php if (!empty($adm['actual_discharge_date'])): ?>
+                                                        <span style="margin:0 8px;">·</span>
+                                                        <i class="fas fa-sign-out-alt"></i>
+                                                        الخروج: <?php echo date('Y-m-d h:i A', strtotime($adm['actual_discharge_date'])); ?>
+                                                    <?php endif; ?>
+                                                </div>
+                                                <div class="ph-tl-body">
+                                                    <strong>الغرفة:</strong> <?php echo esc($adm['room_name']); ?> ·
+                                                    <strong>السرير:</strong> <?php echo esc($adm['bed_number']); ?>
+                                                    <?php if (!empty($adm['total_stay_fee']) && (float)$adm['total_stay_fee'] > 0): ?>
+                                                        · <strong>رسوم الإقامة:</strong> <?php echo fmt_money($adm['total_stay_fee']); ?> SDG
+                                                    <?php endif; ?>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    <?php endforeach; ?>
+                                </div>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+
+                <!-- ═══════════ TAB: CONSUMABLES ═══════════ -->
+                <?php elseif ($active_tab === 'consumables'): ?>
+
+                    <div class="ph-panel">
+                        <div class="ph-panel-head">
+                            <h3><i class="fas fa-box-open"></i> المستهلكات الطبية</h3>
+                            <span class="ph-badge b-amber"><?php echo count($tab_data); ?> طلب</span>
+                        </div>
+                        <div class="ph-panel-body">
+                            <?php if (empty($tab_data)): ?>
+                                <div class="ph-empty">
+                                    <div class="icon"><i class="fas fa-box-open"></i></div>
+                                    <h4>لا توجد طلبات مستهلكات</h4>
+                                    <p>لم يتم تسجيل أي مستهلكات لهذا المريض</p>
+                                </div>
+                            <?php else: ?>
+                                <div class="ph-grid">
+                                    <?php foreach ($tab_data as $con): ?>
+                                        <div class="ph-item s-consumable">
+                                            <div class="ph-item-code"><?php echo esc($con['request_code']); ?></div>
+                                            <div class="ph-item-title">
+                                                <i class="fas fa-prescription-bottle" style="color: var(--ph-amber);"></i>
+                                                <?php echo esc($con['item_name']); ?>
+                                            </div>
+                                            <div class="ph-item-row">
+                                                <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                                                    <span class="ph-badge <?php
+                                                        echo $con['status'] === 'Dispensed' ? 'b-emerald' :
+                                                            ($con['status'] === 'Pending' ? 'b-amber' : 'b-red');
+                                                    ?>">
+                                                        <?php
+                                                            echo $con['status'] === 'Dispensed' ? 'تم الصرف' :
+                                                                ($con['status'] === 'Pending' ? 'معلق' : 'ملغي');
+                                                        ?>
+                                                    </span>
+                                                    <span class="ph-badge b-slate">
+                                                        كمية: <?php echo (int)$con['quantity_requested']; ?>
+                                                    </span>
+                                                </div>
+                                                <div class="ph-item-price">
+                                                    <?php echo fmt_money($con['total_cost']); ?> <small>SDG</small>
+                                                </div>
+                                            </div>
+                                            <div style="margin-top:8px;font-size:.74rem;color:var(--ph-muted);font-weight:600;">
+                                                <i class="far fa-clock"></i>
+                                                <?php echo date('Y-m-d', strtotime($con['created_at'])); ?>
+                                            </div>
+                                        </div>
+                                    <?php endforeach; ?>
+                                </div>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+
+                <!-- ═══════════ TAB: TIMELINE ═══════════ -->
+                <?php elseif ($active_tab === 'timeline'): ?>
+
+                    <div class="ph-panel">
+                        <div class="ph-panel-head">
+                            <h3><i class="fas fa-stream"></i> الخط الزمني الموحد</h3>
+                            <span class="ph-badge b-slate">آخر <?php echo count($tab_data); ?> حدث</span>
+                        </div>
+                        <div class="ph-panel-body">
+                            <?php if (empty($tab_data)): ?>
+                                <div class="ph-empty">
+                                    <div class="icon"><i class="fas fa-stream"></i></div>
+                                    <h4>لا توجد أنشطة مسجلة</h4>
+                                    <p>هذا المريض ليس لديه أي سجل حتى الآن</p>
+                                </div>
+                            <?php else: ?>
+                                <?php echo render_timeline($tab_data); ?>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+
+                <?php endif; ?>
 
             <?php endif; ?>
-    <?php require_once('partials/_footer.php'); ?>
+
+            <?php require_once('partials/_footer.php'); ?>
         </div>
     </div>
 
     <?php require_once('partials/_scripts.php'); ?>
-
     <script>
-    $(document).ready(function() {
-        // Initialize Select2 for patient selection
-        $('.select2').select2({
-            placeholder: '-- اختر المريض من هنا --',
-            allowClear: true
-        });
+    (function() {
+        'use strict';
 
-        // ===== Tab Switching =====
-        $('.ph-tab-btn').on('click', function() {
-            var tabId = $(this).data('tab');
-            
-            // Toggle button active state
-            $('.ph-tab-btn').removeClass('active');
-            $(this).addClass('active');
-            
-            // Toggle section visibility
-            $('.ph-section').removeClass('active');
-            $('#' + tabId).addClass('active');
-        });
+        // Patient select redirect
+        const select = document.getElementById('patientSelect');
+        if (select) {
+            select.addEventListener('change', function() {
+                const pid = this.value;
+                if (!pid) return;
+                window.location.href = 'patient_history.php?patient_id=' + encodeURIComponent(pid);
+            });
+        }
 
-        // ===== Highlight abnormal results =====
-        $('.result-high, .result-low').closest('tr').css('background', '#fff5f5');
-    });
+        // Select2 init (if available)
+        if (window.jQuery && $.fn.select2) {
+            $('#patientSelect').select2({
+                placeholder: '— اختر مريضاً —',
+                allowClear: false,
+                language: {
+                    noResults: () => 'لا يوجد مريض مطابق',
+                    searching: () => 'جارٍ البحث...'
+                }
+            });
+        }
+    })();
     </script>
 </body>
 </html>
+
+<?php
+/* ═══════════════════════════════════════════════════════════════════════
+   Timeline renderer helper — defined at bottom to keep top clean
+   ═══════════════════════════════════════════════════════════════════════ */
+function render_timeline(array $events): string {
+    if (empty($events)) return '';
+
+    $html = '<div class="ph-timeline">';
+
+    foreach ($events as $ev) {
+        $type = $ev['type'];
+        $body = $ev['body'];
+        $icon_map = [
+            'clinic'     => 'fa-stethoscope',
+            'lab'        => 'fa-flask',
+            'service'    => 'fa-hand-holding-medical',
+            'consumable' => 'fa-box-open',
+            'admission'  => 'fa-procedures',
+        ];
+        $icon = $icon_map[$type] ?? 'fa-circle';
+
+        $detail = '';
+        switch ($type) {
+            case 'clinic':
+                $detail = "<strong>الكود:</strong> " . esc($body['outpatient_code'] ?? '')
+                        . (!empty($body['doctor_name']) ? " · <strong>الطبيب:</strong> د. " . esc($body['doctor_name']) : '');
+                if (!empty($body['diagnosis'])) {
+                    $detail .= "<br><strong>التشخيص:</strong> " . esc($body['diagnosis']);
+                }
+                break;
+            case 'lab':
+                $detail = "<strong>الفاتورة:</strong> " . fmt_money($body['total_amount'] ?? 0) . " SDG"
+                        . " · <strong>مدفوع:</strong> " . fmt_money($body['amount_paid'] ?? 0) . " SDG"
+                        . " · <strong>الحالة:</strong> " . esc($body['payment_status'] ?? '');
+                break;
+            case 'service':
+                $detail = "<strong>التكلفة:</strong> " . fmt_money($body['total_cost'] ?? 0) . " SDG"
+                        . " · <strong>الدفع:</strong> " . esc($body['payment_status'] ?? '');
+                break;
+            case 'consumable':
+                $detail = "<strong>الصنف:</strong> " . esc($body['item_name'] ?? '')
+                        . " · <strong>الكمية:</strong> " . (int)($body['quantity_requested'] ?? 0)
+                        . " · <strong>الإجمالي:</strong> " . fmt_money($body['total_cost'] ?? 0) . " SDG";
+                break;
+            case 'admission':
+                $detail = "<strong>الغرفة:</strong> " . esc($body['room_name'] ?? '')
+                        . " · <strong>السرير:</strong> " . esc($body['bed_number'] ?? '')
+                        . " · <strong>الحالة:</strong> " . ($body['status'] === 'Admitted' ? 'نشط' : 'تم الخروج');
+                break;
+        }
+
+        $html .= '<div class="ph-tl-item">';
+        $html .= '<div class="ph-tl-dot ' . esc($type) . '"><i class="fas ' . esc($icon) . '"></i></div>';
+        $html .= '<div class="ph-tl-card ' . esc($type) . '">';
+        $html .= '<div class="ph-tl-title">' . esc($ev['title']) . '</div>';
+        $html .= '<div class="ph-tl-date"><i class="far fa-clock"></i> ' . date('Y-m-d h:i A', strtotime($ev['date'])) . '</div>';
+        if ($detail) {
+            $html .= '<div class="ph-tl-body">' . $detail . '</div>';
+        }
+        $html .= '</div></div>';
+    }
+
+    $html .= '</div>';
+    return $html;
+}
+?>

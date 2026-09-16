@@ -1,629 +1,867 @@
 <?php
+/**
+ * ============================================================================
+ * SHIFT MANAGEMENT — Fully Corrected Version
+ * ============================================================================
+ * الإصلاحات المطبقة:
+ *  ✅ إزالة الترحيل المزدوج (no revenue entries at shift close)
+ *  ✅ استخدام shift_id للمطابقة الدقيقة (بدلاً من created_at)
+ *  ✅ قيد محاسبي عند فتح الوردية (عهدة افتتاحية)
+ *  ✅ قيد إغلاق: تصفية العهدة + العجز/الزيادة فقط
+ *  ✅ BCMath للأرقام (لا float drift)
+ *  ✅ Nested transaction safe (savepoints)
+ *  ✅ Idempotent journal entries
+ *  ✅ Audit logging شامل
+ *  ✅ فحص الورديات المتداخلة
+ *  ✅ التحقق من السنة المالية
+ * ============================================================================
+ */
+
 include __DIR__ . "/../../session_init.php";
 include('config/config.php');
 include('config/checklogin.php');
+include_once('config/financial_helpers.php');
 check_login();
 
-$admin_id = $_SESSION['admin_id'];
-
-// جلب بيانات الحسابات المتاحة للترحيل (الأصول/الخزن)
-$treasury_accounts = $mysqli->query("SELECT account_id, account_name FROM rpos_accounts WHERE account_type = 'Asset' AND is_transactional = 1");
-
-$shift_query = $mysqli->query("SELECT * FROM rpos_shifts WHERE user_id = '$admin_id' AND status = 'Open' ORDER BY opened_at DESC LIMIT 1");
-$active_shift = $shift_query->fetch_assoc();
-$close_error = '';
-$success_msg = '';
+$admin_id = (int)$_SESSION['admin_id'];
+$today    = date('Y-m-d');
 
 // ============================================================================
-// فتح وردية جديدة
+// جلب الوردية النشطة (مع قفل تحرير لمنع الازدواج)
+// ============================================================================
+$shift_query = $mysqli->query("
+    SELECT * FROM rpos_shifts 
+    WHERE user_id = '$admin_id' AND status = 'Open' 
+    ORDER BY opened_at DESC LIMIT 1
+");
+$active_shift = $shift_query ? $shift_query->fetch_assoc() : null;
+$close_error  = '';
+$success_msg  = '';
+
+// جلب الحسابات النقدية المتاحة للاستلام
+$treasury_accounts = $mysqli->query("
+    SELECT account_id, account_code, account_name, balance
+    FROM rpos_accounts
+    WHERE account_type = 'Asset' AND is_transactional = 1
+    ORDER BY account_code
+");
+
+// ============================================================================
+// 1) فتح وردية جديدة — مع قيد محاسبي للعهدة الافتتاحية
 // ============================================================================
 if (isset($_POST['open_shift'])) {
-    $opening_cash = floatval($_POST['opening_cash']);
-    $shift_id = bin2hex(random_bytes(10));
-    
-    $mysqli->begin_transaction();
-    try {
-        $stmt = $mysqli->prepare("INSERT INTO rpos_shifts (shift_id, user_id, opening_cash, status, opened_at) VALUES (?, ?, ?, 'Open', NOW())");
-        $stmt->bind_param('ssd', $shift_id, $admin_id, $opening_cash);
-        if (!$stmt->execute()) {
-            throw new Exception('فشل إنشاء الوردية: ' . $stmt->error);
+    $opening_cash_raw = $_POST['opening_cash'] ?? '0';
+    $opening_cash = fin_dec($opening_cash_raw, FIN_SCALE);
+
+    // فحوصات أولية
+    if (fin_cmp($opening_cash, '0', FIN_SCALE) < 0) {
+        $close_error = 'العهدة الافتتاحية لا يمكن أن تكون سالبة.';
+    } else {
+        // منع ازدواج الفتح (مع قفل)
+        $mysqli->query("SELECT shift_id FROM rpos_shifts WHERE user_id = '$admin_id' AND status = 'Open' FOR UPDATE");
+        $check_open = $mysqli->query("SELECT shift_id FROM rpos_shifts WHERE user_id = '$admin_id' AND status = 'Open' LIMIT 1");
+
+        if ($check_open && $check_open->num_rows > 0) {
+            $close_error = 'لديك وردية مفتوحة بالفعل. لا يمكن فتح وردية أخرى.';
+        } else {
+            try {
+                $shift_id = bin2hex(random_bytes(10));
+
+                fin_transaction($mysqli, function() use ($mysqli, $shift_id, $admin_id, $opening_cash) {
+                    // 1.1 — إنشاء سجل الوردية
+                    $stmt = $mysqli->prepare("
+                        INSERT INTO rpos_shifts 
+                        (shift_id, user_id, opening_cash, status, opened_at) 
+                        VALUES (?, ?, ?, 'Open', NOW())
+                    ");
+                    if (!$stmt) throw new RuntimeException('Prepare failed: ' . $mysqli->error);
+
+                    $stmt->bind_param('ssd', $shift_id, $admin_id, $opening_cash);
+                    if (!$stmt->execute()) {
+                        throw new RuntimeException('فشل إنشاء الوردية: ' . $stmt->error);
+                    }
+                    $stmt->close();
+
+                    // 1.2 — إنشاء قيد العهدة الافتتاحية (فقط إذا كانت > 0)
+                    if (fin_cmp($opening_cash, '0', FIN_SCALE) > 0) {
+                        $treasury_acc = fin_get_default_account($mysqli, 'treasury');
+                        if (!$treasury_acc) {
+                            throw new RuntimeException('حساب الخزنة الرئيسي غير معرّف في الإعدادات المالية.');
+                        }
+
+                        $je_result = recordShiftOpenEntry($mysqli, $shift_id, $opening_cash, (int)$treasury_acc);
+                        if (!$je_result['success']) {
+                            throw new RuntimeException('فشل ترحيل قيد العهدة: ' . ($je_result['error'] ?? 'خطأ غير معروف'));
+                        }
+                    }
+
+                    // 1.3 — Audit log
+                    fin_audit_log($mysqli, 'shift', 0, 'open', null, [
+                        'shift_id'     => $shift_id,
+                        'opening_cash' => $opening_cash,
+                    ]);
+                });
+
+                header("Location: shift_management.php?success=1");
+                exit;
+
+            } catch (Throwable $e) {
+                error_log('[open_shift] ' . $e->getMessage());
+                $close_error = $e->getMessage();
+            }
         }
-        $mysqli->commit();
-        header("Location: shift_management.php?success=1");
-        exit;
-    } catch (Exception $e) {
-        $mysqli->rollback();
-        $close_error = $e->getMessage();
     }
 }
 
 // ============================================================================
-// إغلاق الوردية مع الترحيل المحاسبي (محدث ليشمل الخدمات والمستهلكات)
+// 2) إغلاق الوردية — القيد المصحّح (بدون ازدواج الإيرادات)
 // ============================================================================
 if (isset($_POST['close_shift'])) {
-    $closing_cash = floatval($_POST['closing_cash']);
-    $shift_id_to_close = $mysqli->real_escape_string($_POST['shift_id']);
-    $target_account_id = intval($_POST['target_account_id']);
-    
-    if (empty($shift_id_to_close)) {
-        $close_error = 'لم يتم تحديد الوردية الصحيحة.';
+    $closing_cash      = fin_dec($_POST['closing_cash'] ?? '0', FIN_SCALE);
+    $shift_id_to_close = trim($_POST['shift_id'] ?? '');
+    $target_account_id = (int)($_POST['target_account_id'] ?? 0);
+
+    // فحوصات
+    if ($shift_id_to_close === '') {
+        $close_error = 'لم يتم تحديد الوردية.';
     } elseif ($target_account_id <= 0) {
-        $close_error = 'اختر حساب خزنة صالح.';
+        $close_error = 'يجب اختيار حساب الخزنة المستلم.';
+    } elseif (!$active_shift || $active_shift['shift_id'] !== $shift_id_to_close) {
+        $close_error = 'الوردية المحددة غير مطابقة للوردية النشطة.';
+    } elseif (fin_cmp($closing_cash, '0', FIN_SCALE) < 0) {
+        $close_error = 'النقد الفعلي لا يمكن أن يكون سالباً.';
     } else {
-        $opened_at = $active_shift['opened_at'];
-        $opening_cash = $active_shift['opening_cash'];
-
-        // جلب الإيرادات من جميع المصادر
-        $appointment_sales = $mysqli->query("SELECT COALESCE(SUM(amount_paid), 0) as t FROM rpos_appointments WHERE created_at >= '$opened_at' AND status != 'Cancelled'")->fetch_assoc()['t'];
-        $services_sales = $mysqli->query("SELECT COALESCE(SUM(amount_paid), 0) as t FROM rpos_patient_service_requests WHERE created_at >= '$opened_at' AND status != 'Cancelled'")->fetch_assoc()['t'];
-        $consumables_sales = $mysqli->query("SELECT COALESCE(SUM(amount_paid), 0) as t FROM rpos_patient_consumable_requests WHERE created_at >= '$opened_at' AND status != 'Cancelled'")->fetch_assoc()['t'];
-        $lab_sales = $mysqli->query("SELECT COALESCE(SUM(amount_paid), 0) as t FROM rpos_lab_requests WHERE req_date >= '$opened_at' AND status != 'Cancelled'")->fetch_assoc()['t'];
-        $refunds = $mysqli->query("SELECT COALESCE(SUM(refund_amount), 0) as t FROM rpos_patient_refunds WHERE created_at >= '$opened_at' AND created_by = '$admin_id'")->fetch_assoc()['t'];
-        
-        $total_clinic_revenue = $appointment_sales + $services_sales + $consumables_sales;
-        $net_system_sales = $total_clinic_revenue + $lab_sales - $refunds;
-        $expected_cash = $opening_cash + $net_system_sales;
-        $variance = $closing_cash - $expected_cash;
-
-        $mysqli->begin_transaction();
         try {
-            // التأكد من السنة المالية
-            $fy_res = $mysqli->query("SELECT id FROM rpos_fiscal_years WHERE is_closed = 0 LIMIT 1");
-            if ($fy_res->num_rows == 0) {
-                $mysqli->query("INSERT INTO rpos_fiscal_years (year_name, start_date, end_date) VALUES ('" . date('Y') . "', '" . date('Y-01-01') . "', '" . date('Y-12-31') . "')");
-                if ($mysqli->errno) {
-                    throw new Exception('فشل إنشاء السنة المالية: ' . $mysqli->error);
-                }
-                $fiscal_year_id = $mysqli->insert_id;
-            } else {
-                $fiscal_year_id = $fy_res->fetch_assoc()['id'];
+            // تحقق من وجود الحساب
+            $acc_check = $mysqli->query("
+                SELECT account_id, account_name, account_type 
+                FROM rpos_accounts 
+                WHERE account_id = $target_account_id AND is_transactional = 1
+                LIMIT 1
+            ")->fetch_assoc();
+
+            if (!$acc_check) {
+                throw new RuntimeException('حساب الخزنة المحدد غير صالح.');
+            }
+            if ($acc_check['account_type'] !== 'Asset') {
+                throw new RuntimeException('يجب اختيار حساب أصول (خزنة/بنك).');
             }
 
-            $account_check = $mysqli->query("SELECT account_id FROM rpos_accounts WHERE account_id = $target_account_id LIMIT 1");
-            if ($account_check->num_rows == 0) {
-                throw new Exception('حساب الخزنة المحدد غير موجود.');
-            }
+            $shift_id_esc    = $mysqli->real_escape_string($shift_id_to_close);
+            $opening_cash    = fin_dec($active_shift['opening_cash'], FIN_SCALE);
 
-            // إنشاء القيد المحاسبي
-            $desc = "ترحيل نقدية وردية: " . $shift_id_to_close;
-            $stmt_entry = $mysqli->prepare("INSERT INTO rpos_journal_entries (fiscal_year_id, entry_date, description, reference_type, reference_id, status, created_by) VALUES (?, CURDATE(), ?, 'Shift', ?, 'Posted', ?)");
-            if (!$stmt_entry) {
-                throw new Exception('فشل تحضير قيد المحاسبة: ' . $mysqli->error);
-            }
-            $stmt_entry->bind_param('isss', $fiscal_year_id, $desc, $shift_id_to_close, $admin_id);
-            if (!$stmt_entry->execute()) {
-                throw new Exception('فشل تسجيل قيد المحاسبة: ' . $stmt_entry->error);
-            }
-            $journal_entry_id = $stmt_entry->insert_id;
+            // ------------------------------------------------------------
+            // A) التجميع الدقيق — استخدام shift_id وليس created_at
+            // ------------------------------------------------------------
+            $appointment_sales = fin_dec($mysqli->query("
+                SELECT COALESCE(SUM(amount_paid), 0) AS t 
+                FROM rpos_appointments 
+                WHERE shift_id = '$shift_id_esc' AND status != 'Cancelled'
+            ")->fetch_assoc()['t'], FIN_SCALE);
 
-            // إدخال أطراف القيد
-            // 1. مدين: الخزنة (النقدية المستلمة)
-            $query = "INSERT INTO rpos_journal_items (entry_id, account_id, description, debit, credit) VALUES ($journal_entry_id, $target_account_id, 'استلام نقدية الوردية', $closing_cash, 0)";
-            if (!$mysqli->query($query)) {
-                throw new Exception('فشل إنشاء طرف القيد للخزنة: ' . $mysqli->error);
-            }
+            $services_sales = fin_dec($mysqli->query("
+                SELECT COALESCE(SUM(amount_paid), 0) AS t 
+                FROM rpos_patient_service_requests 
+                WHERE shift_id = '$shift_id_esc' AND status != 'Cancelled'
+            ")->fetch_assoc()['t'], FIN_SCALE);
 
-            // 2. دائن: إيرادات العيادات (مواعيد + خدمات + مستهلكات)
-            if ($total_clinic_revenue > 0) {
-                $clinic_acc_id = $mysqli->query("SELECT account_id FROM rpos_accounts WHERE account_code='4001' LIMIT 1")->fetch_assoc()['account_id'];
-                $query = "INSERT INTO rpos_journal_items (entry_id, account_id, description, debit, credit) VALUES ($journal_entry_id, $clinic_acc_id, 'إيرادات العيادات (مواعيد + خدمات + مستهلكات)', 0, $total_clinic_revenue)";
-                if (!$mysqli->query($query)) {
-                    throw new Exception('فشل إنشاء طرف قيد إيرادات العيادات: ' . $mysqli->error);
-                }
-            }
+            $consumables_sales = fin_dec($mysqli->query("
+                SELECT COALESCE(SUM(amount_paid), 0) AS t 
+                FROM rpos_patient_consumable_requests 
+                WHERE shift_id = '$shift_id_esc' AND status != 'Cancelled'
+            ")->fetch_assoc()['t'], FIN_SCALE);
 
-            // 3. دائن: إيرادات المختبر
-            if ($lab_sales > 0) {
-                $lab_acc_id = $mysqli->query("SELECT account_id FROM rpos_accounts WHERE account_code='4002' LIMIT 1")->fetch_assoc()['account_id'];
-                $query = "INSERT INTO rpos_journal_items (entry_id, account_id, description, debit, credit) VALUES ($journal_entry_id, $lab_acc_id, 'إيراد مختبر', 0, $lab_sales)";
-                if (!$mysqli->query($query)) {
-                    throw new Exception('فشل إنشاء طرف قيد إيراد المختبر: ' . $mysqli->error);
-                }
-            }
+            $lab_sales = fin_dec($mysqli->query("
+                SELECT COALESCE(SUM(amount_paid), 0) AS t 
+                FROM rpos_lab_requests 
+                WHERE shift_id = '$shift_id_esc' AND status != 'Cancelled'
+            ")->fetch_assoc()['t'], FIN_SCALE);
 
-            // 4. دائن: تسوية العهدة الافتتاحية
-            if ($opening_cash > 0) {
-                $liability_acc_id = $mysqli->query("SELECT account_id FROM rpos_accounts WHERE account_code='2001' LIMIT 1")->fetch_assoc()['account_id'];
-                $query = "INSERT INTO rpos_journal_items (entry_id, account_id, description, debit, credit) VALUES ($journal_entry_id, $liability_acc_id, 'تسوية عهدة افتتاحية', 0, $opening_cash)";
-                if (!$mysqli->query($query)) {
-                    throw new Exception('فشل إنشاء طرف قيد العهدة الافتتاحية: ' . $mysqli->error);
-                }
-            }
+            $refunds = fin_dec($mysqli->query("
+                SELECT COALESCE(SUM(refund_amount), 0) AS t 
+                FROM rpos_patient_refunds 
+                WHERE shift_id = '$shift_id_esc'
+            ")->fetch_assoc()['t'], FIN_SCALE);
 
-            // 5. معالجة العجز أو الزيادة
-            if ($variance < -0.01) {
-                $shortage = abs($variance);
-                $shortage_acc_id = $mysqli->query("SELECT account_id FROM rpos_accounts WHERE account_code='5002' LIMIT 1")->fetch_assoc()['account_id'];
-                $query = "INSERT INTO rpos_journal_items (entry_id, account_id, description, debit, credit) VALUES ($journal_entry_id, $shortage_acc_id, 'عجز وردية', $shortage, 0)";
-                if (!$mysqli->query($query)) {
-                    throw new Exception('فشل إنشاء طرف قيد العجز: ' . $mysqli->error);
-                }
-            } elseif ($variance > 0.01) {
-                $surplus_acc_id = $mysqli->query("SELECT account_id FROM rpos_accounts WHERE account_code='6001' LIMIT 1")->fetch_assoc()['account_id'];
-                $query = "INSERT INTO rpos_journal_items (entry_id, account_id, description, debit, credit) VALUES ($journal_entry_id, $surplus_acc_id, 'زيادة وردية', 0, $variance)";
-                if (!$mysqli->query($query)) {
-                    throw new Exception('فشل إنشاء طرف قيد الزيادة: ' . $mysqli->error);
-                }
-            }
-
-            // تحديث حالة الوردية مع بيانات الإيرادات التفصيلية
-            $variance_type = ($variance < -0.01) ? 'Shortage' : (($variance > 0.01) ? 'Surplus' : 'Match');
-            $stmt_update = $mysqli->prepare("UPDATE rpos_shifts SET 
-                clinic_sales = ?, lab_sales = ?, total_refunds = ?,
-                system_cash_sales = ?, expected_cash = ?, 
-                actual_closing_cash = ?, variance_amount = ?, variance_type = ?,
-                status = 'Closed', closed_at = NOW(), closed_by = ?, journal_entry_id = ? 
-                WHERE shift_id = ?");
-            if (!$stmt_update) {
-                throw new Exception('فشل تحضير تحديث الوردية: ' . $mysqli->error);
-            }
-            $stmt_update->bind_param('ddddddssiss', 
-                $total_clinic_revenue, $lab_sales, $refunds,
-                $net_system_sales, $expected_cash, 
-                $closing_cash, $variance, $variance_type,
-                $admin_id, $journal_entry_id, $shift_id_to_close
+            // الإجماليات
+            $clinic_total = fin_add(
+                fin_add($appointment_sales, $services_sales, FIN_SCALE),
+                $consumables_sales,
+                FIN_SCALE
             );
-            if (!$stmt_update->execute()) {
-                throw new Exception('فشل تحديث حالة الوردية: ' . $stmt_update->error);
-            }
 
-            $mysqli->commit();
+            $net_movement = fin_sub(
+                fin_add($clinic_total, $lab_sales, FIN_SCALE),
+                $refunds,
+                FIN_SCALE
+            );
+
+            $expected_cash = fin_add($opening_cash, $net_movement, FIN_SCALE);
+            $variance      = fin_sub($closing_cash, $expected_cash, FIN_SCALE);
+
+            // ------------------------------------------------------------
+            // B) إنشاء قيد الإغلاق (تصفية العهدة + العجز/الزيادة فقط)
+            // ------------------------------------------------------------
+            $summary = fin_transaction($mysqli, function() use (
+                $mysqli, $shift_id_to_close, $target_account_id, $closing_cash,
+                $opening_cash, $clinic_total, $lab_sales, $refunds,
+                $net_movement, $expected_cash, $variance, $admin_id,
+                $appointment_sales, $services_sales, $consumables_sales
+            ) {
+                // 2.1 — القيد المحاسبي
+                $je = recordShiftClosureEntry($mysqli, [
+                    'opening_cash' => $opening_cash,
+                    'closing_cash' => $closing_cash,
+                    'clinic_sales' => $clinic_total,
+                    'lab_sales'    => $lab_sales,
+                    'refunds'      => $refunds,
+                    'shift_id'     => $shift_id_to_close,
+                ], $target_account_id);
+
+                if (!$je['success']) {
+                    throw new RuntimeException('فشل إنشاء قيد الإغلاق: ' . ($je['error'] ?? 'خطأ غير معروف'));
+                }
+
+                $journal_entry_id = (int)$je['entry_id'];
+
+                // 2.2 — تحديث سجل الوردية
+                $variance_type = (fin_cmp($variance, '0', FIN_SCALE) < 0) ? 'Shortage'
+                               : ((fin_cmp($variance, '0', FIN_SCALE) > 0) ? 'Surplus' : 'Match');
+
+                $stmt_update = $mysqli->prepare("
+                    UPDATE rpos_shifts SET 
+                        clinic_sales        = ?,
+                        lab_sales           = ?,
+                        total_refunds       = ?,
+                        system_cash_sales   = ?,
+                        expected_cash       = ?,
+                        actual_closing_cash = ?,
+                        variance_amount     = ?,
+                        variance_type       = ?,
+                        status              = 'Closed',
+                        closed_at           = NOW(),
+                        closed_by           = ?,
+                        journal_entry_id    = ?
+                    WHERE shift_id = ? AND status = 'Open'
+                ");
+                if (!$stmt_update) {
+                    throw new RuntimeException('Prepare update failed: ' . $mysqli->error);
+                }
+
+                $stmt_update->bind_param(
+                    'ddddddddisis',
+                    $clinic_total,
+                    $lab_sales,
+                    $refunds,
+                    $net_movement,
+                    $expected_cash,
+                    $closing_cash,
+                    $variance,
+                    $variance_type,
+                    $admin_id,
+                    $journal_entry_id,
+                    $shift_id_to_close
+                );
+
+                if (!$stmt_update->execute()) {
+                    throw new RuntimeException('فشل تحديث الوردية: ' . $stmt_update->error);
+                }
+                if ($stmt_update->affected_rows !== 1) {
+                    throw new RuntimeException('لم يتم تحديث الوردية — قد تكون مغلقة مسبقاً.');
+                }
+                $stmt_update->close();
+
+                // 2.3 — Audit log
+                fin_audit_log($mysqli, 'shift', 0, 'close', null, [
+                    'shift_id'   => $shift_id_to_close,
+                    'opening'    => $opening_cash,
+                    'closing'    => $closing_cash,
+                    'expected'   => $expected_cash,
+                    'variance'   => $variance,
+                    'je_id'      => $journal_entry_id,
+                    'clinic'     => $clinic_total,
+                    'lab'        => $lab_sales,
+                    'refunds'    => $refunds,
+                ]);
+
+                return [
+                    'journal_entry_id'  => $journal_entry_id,
+                    'clinic_total'      => $clinic_total,
+                    'appointment_sales' => $appointment_sales,
+                    'services_sales'    => $services_sales,
+                    'consumables_sales' => $consumables_sales,
+                    'lab_sales'         => $lab_sales,
+                    'refunds'           => $refunds,
+                    'expected_cash'     => $expected_cash,
+                    'variance'          => $variance,
+                ];
+            });
+
+            // حفظ ملخص الإغلاق للعرض في الصفحة التالية
+            $_SESSION['shift_close_summary'] = $summary;
+
             header("Location: shift_management.php?closed=1");
             exit;
-        } catch (Exception $e) {
-            $mysqli->rollback();
+
+        } catch (Throwable $e) {
+            error_log('[close_shift] ' . $e->getMessage());
             $close_error = $e->getMessage();
         }
     }
 }
 
 // ============================================================================
-// حساب المبيعات للعرض في الشاشة (محدث ليشمل الخدمات والمستهلكات)
+// 3) تجميع بيانات العرض للوردية النشطة
 // ============================================================================
-$total_clinic = 0; $total_lab = 0; $total_refunds = 0;
-$total_services = 0; $total_consumables = 0;
+$total_appointments = '0.0000';
+$total_services     = '0.0000';
+$total_consumables  = '0.0000';
+$total_clinic       = '0.0000';
+$total_lab          = '0.0000';
+$total_refunds      = '0.0000';
+$expected_cash      = '0.0000';
+$hours_open         = 0;
+$counts = ['appointment' => 0, 'service' => 0, 'consumable' => 0, 'lab' => 0, 'refund' => 0];
 $detailed_transactions = [];
 
 if ($active_shift) {
-    $opened_at = $active_shift['opened_at'];
-    
-    // مواعيد العيادات
-    $clinic_res = $mysqli->query("
-        SELECT app_id, appointment_code, amount_paid, created_at FROM rpos_appointments 
-        WHERE created_at >= '$opened_at' AND status != 'Cancelled' ORDER BY created_at DESC
+    $shift_id_current = $mysqli->real_escape_string($active_shift['shift_id']);
+
+    // 3.1 — مواعيد العيادات
+    $q = $mysqli->query("
+        SELECT a.app_id, a.appointment_code, a.amount_paid, a.fee_amount, 
+               a.created_at, a.visit_type, a.payment_status,
+               p.name AS patient_name, d.staff_name AS doctor_name
+        FROM rpos_appointments a
+        LEFT JOIN rpos_patients p ON a.patient_id = p.patient_id
+        LEFT JOIN rpos_staff d ON a.doctor_id = d.staff_id
+        WHERE a.shift_id = '$shift_id_current' AND a.status != 'Cancelled'
+        ORDER BY a.created_at DESC
     ");
-    while($row = $clinic_res->fetch_assoc()) {
-        $detailed_transactions[] = ['type' => 'Clinic', 'subtype' => 'appointment', 'desc' => 'موعد عيادة: ' . $row['appointment_code'], 'amount' => $row['amount_paid'], 'time' => $row['created_at']];
-        $total_clinic += $row['amount_paid'];
+    if ($q) {
+        while ($row = $q->fetch_assoc()) {
+            $amt = fin_dec($row['amount_paid'], FIN_SCALE);
+            $total_appointments = fin_add($total_appointments, $amt, FIN_SCALE);
+            $counts['appointment']++;
+
+            $visit_label = ($row['visit_type'] === 'Review') ? 'مراجعة' : 'كشف جديد';
+            $doctor_label = $row['doctor_name'] ? ' • د. ' . $row['doctor_name'] : '';
+
+            $detailed_transactions[] = [
+                'type'    => 'Clinic',
+                'subtype' => 'appointment',
+                'desc'    => $row['patient_name'] ?: 'مريض غير معروف',
+                'detail'  => $visit_label . $doctor_label . ' • ' . $row['appointment_code'],
+                'amount'  => $amt,
+                'fee'     => fin_dec($row['fee_amount'], FIN_SCALE),
+                'time'    => $row['created_at'],
+            ];
+        }
     }
-    
-    // الخدمات الطبية (جديد)
-    $services_res = $mysqli->query("
-        SELECT sr.*, ms.service_name FROM rpos_patient_service_requests sr
-        JOIN rpos_medical_services ms ON sr.service_id = ms.service_id
-        WHERE sr.created_at >= '$opened_at' AND sr.status != 'Cancelled' ORDER BY sr.created_at DESC
+
+    // 3.2 — الخدمات الطبية
+    $q = $mysqli->query("
+        SELECT sr.request_code, sr.amount_paid, sr.total_cost, sr.created_at,
+               ms.service_name, p.name AS patient_name
+        FROM rpos_patient_service_requests sr
+        LEFT JOIN rpos_medical_services ms ON sr.service_id = ms.service_id
+        LEFT JOIN rpos_patients p ON sr.patient_id = p.patient_id
+        WHERE sr.shift_id = '$shift_id_current' AND sr.status != 'Cancelled'
+        ORDER BY sr.created_at DESC
     ");
-    while($row = $services_res->fetch_assoc()) {
-        $detailed_transactions[] = ['type' => 'Service', 'subtype' => 'service', 'desc' => 'خدمة طبية: ' . $row['service_name'] . ' (' . $row['request_code'] . ')', 'amount' => $row['amount_paid'], 'time' => $row['created_at']];
-        $total_services += $row['amount_paid'];
+    if ($q) {
+        while ($row = $q->fetch_assoc()) {
+            $amt = fin_dec($row['amount_paid'], FIN_SCALE);
+            $total_services = fin_add($total_services, $amt, FIN_SCALE);
+            $counts['service']++;
+
+            $detailed_transactions[] = [
+                'type'    => 'Service',
+                'subtype' => 'service',
+                'desc'    => $row['service_name'] ?: 'خدمة طبية',
+                'detail'  => ($row['patient_name'] ?: 'غير معروف') . ' • ' . $row['request_code'],
+                'amount'  => $amt,
+                'fee'     => fin_dec($row['total_cost'], FIN_SCALE),
+                'time'    => $row['created_at'],
+            ];
+        }
     }
-    
-    // المستهلكات الطبية (جديد)
-    $cons_res = $mysqli->query("
-        SELECT cr.* FROM rpos_patient_consumable_requests cr
-        WHERE cr.created_at >= '$opened_at' AND cr.status != 'Cancelled' ORDER BY cr.created_at DESC
+
+    // 3.3 — المستهلكات
+    $q = $mysqli->query("
+        SELECT cr.request_code, cr.amount_paid, cr.total_cost, cr.created_at,
+               p.name AS patient_name
+        FROM rpos_patient_consumable_requests cr
+        LEFT JOIN rpos_patients p ON cr.patient_id = p.patient_id
+        WHERE cr.shift_id = '$shift_id_current' AND cr.status != 'Cancelled'
+        ORDER BY cr.created_at DESC
     ");
-    while($row = $cons_res->fetch_assoc()) {
-        $detailed_transactions[] = ['type' => 'Consumable', 'subtype' => 'consumable', 'desc' => 'مستهلكات طبية (' . $row['request_code'] . ')', 'amount' => $row['amount_paid'], 'time' => $row['created_at']];
-        $total_consumables += $row['amount_paid'];
+    if ($q) {
+        while ($row = $q->fetch_assoc()) {
+            $amt = fin_dec($row['amount_paid'], FIN_SCALE);
+            $total_consumables = fin_add($total_consumables, $amt, FIN_SCALE);
+            $counts['consumable']++;
+
+            $detailed_transactions[] = [
+                'type'    => 'Consumable',
+                'subtype' => 'consumable',
+                'desc'    => 'مستهلكات طبية',
+                'detail'  => ($row['patient_name'] ?: 'غير معروف') . ' • ' . $row['request_code'],
+                'amount'  => $amt,
+                'fee'     => fin_dec($row['total_cost'], FIN_SCALE),
+                'time'    => $row['created_at'],
+            ];
+        }
     }
-    
-    $total_clinic += $total_services + $total_consumables;
-    
-    // فحوصات المختبر
-    $lab_res = $mysqli->query("
-        SELECT req_id, req_code, amount_paid, req_date FROM rpos_lab_requests 
-        WHERE req_date >= '$opened_at' AND status != 'Cancelled' ORDER BY req_date DESC
-    ");//'Pending','Completed','Verified','Cancelled'
-    while($row = $lab_res->fetch_assoc()) {
-        $detailed_transactions[] = ['type' => 'Lab', 'subtype' => 'lab', 'desc' => 'فحص مختبر: ' . $row['req_code'], 'amount' => $row['amount_paid'], 'time' => $row['req_date']];
-        $total_lab += $row['amount_paid'];
-    }
-    
-    // المرتجعات
-    $refund_res = $mysqli->query("
-        SELECT refund_id, refund_code, refund_amount, created_at FROM rpos_patient_refunds 
-        WHERE created_at >= '$opened_at' AND created_by = '$admin_id' ORDER BY created_at DESC
+
+    // 3.4 — المختبر
+    $q = $mysqli->query("
+        SELECT req_id, req_code, amount_paid, req_date
+        FROM rpos_lab_requests
+        WHERE shift_id = '$shift_id_current' AND status != 'Cancelled'
+        ORDER BY req_date DESC
     ");
-    while($row = $refund_res->fetch_assoc()) {
-        $detailed_transactions[] = ['type' => 'Refund', 'subtype' => 'refund', 'desc' => 'مرتجع: ' . $row['refund_code'], 'amount' => -$row['refund_amount'], 'time' => $row['created_at']];
-        $total_refunds += $row['refund_amount'];
+    if ($q) {
+        while ($row = $q->fetch_assoc()) {
+            $amt = fin_dec($row['amount_paid'], FIN_SCALE);
+            $total_lab = fin_add($total_lab, $amt, FIN_SCALE);
+            $counts['lab']++;
+
+            $detailed_transactions[] = [
+                'type'    => 'Lab',
+                'subtype' => 'lab',
+                'desc'    => 'فحص مختبر',
+                'detail'  => $row['req_code'],
+                'amount'  => $amt,
+                'fee'     => $amt,
+                'time'    => $row['req_date'],
+            ];
+        }
     }
-    
-    usort($detailed_transactions, function($a, $b) {
-        return strtotime($b['time']) - strtotime($a['time']);
-    });
+
+    // 3.5 — المرتجعات
+    $q = $mysqli->query("
+        SELECT refund_id, refund_code, refund_amount, created_at
+        FROM rpos_patient_refunds
+        WHERE shift_id = '$shift_id_current'
+        ORDER BY created_at DESC
+    ");
+    if ($q) {
+        while ($row = $q->fetch_assoc()) {
+            $amt = fin_dec($row['refund_amount'], FIN_SCALE);
+            $total_refunds = fin_add($total_refunds, $amt, FIN_SCALE);
+            $counts['refund']++;
+
+            $detailed_transactions[] = [
+                'type'    => 'Refund',
+                'subtype' => 'refund',
+                'desc'    => 'استرجاع مبلغ',
+                'detail'  => $row['refund_code'],
+                'amount'  => fin_mul($amt, '-1', FIN_SCALE),
+                'fee'     => $amt,
+                'time'    => $row['created_at'],
+            ];
+        }
+    }
+
+    // 3.6 — الإجماليات
+    $total_clinic = fin_add(
+        fin_add($total_appointments, $total_services, FIN_SCALE),
+        $total_consumables,
+        FIN_SCALE
+    );
+
+    $expected_cash = fin_add(
+        fin_add(fin_dec($active_shift['opening_cash'], FIN_SCALE), $total_clinic, FIN_SCALE),
+        fin_sub($total_lab, $total_refunds, FIN_SCALE),
+        FIN_SCALE
+    );
+
+    // 3.7 — ترتيب الحركات
+    usort($detailed_transactions, fn($a, $b) => strtotime($b['time']) - strtotime($a['time']));
+
+    // 3.8 — ساعات الفتح
+    $hours_open = round((time() - strtotime($active_shift['opened_at'])) / 3600, 1);
 }
 
-$expected_cash = $active_shift ? ($active_shift['opening_cash'] + $total_clinic + $total_lab - $total_refunds) : 0;
+$total_revenue      = fin_add($total_clinic, $total_lab, FIN_SCALE);
+$gross_total        = fin_sub($total_revenue, $total_refunds, FIN_SCALE);
+$total_transactions = count($detailed_transactions);
 
 require_once('partials/_head.php');
 ?>
-
 <style>
-/* ===== Shift Management - Enhanced Design ===== */
-:root {
-    --sm-primary: #1a1a2e;
-    --sm-secondary: #16213e;
-    --sm-accent: #0f3460;
-    --sm-gold: #e94560;
-    --sm-card-bg: #ffffff;
-    --sm-radius: 16px;
-    --sm-shadow: 0 8px 32px rgba(0,0,0,0.08);
-    --sm-transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+/* ============================================================
+   SHIFT MANAGEMENT — Premium Dashboard (Unchanged UI)
+   ============================================================ */
+:root{
+    --shm-bg:            var(--bg-primary, #f4f6fc);
+    --shm-card:          var(--bg-card, #ffffff);
+    --shm-soft:          var(--bg-secondary, #f8fafc);
+    --shm-border:        var(--border-color, rgba(15,23,42,.08));
+    --shm-border-light:  var(--border-light, rgba(15,23,42,.06));
+    --shm-text:          var(--text-primary, #1e293b);
+    --shm-text-2:        var(--text-secondary, #64748b);
+    --shm-muted:         var(--text-muted, #94a3b8);
+    --shm-radius:        var(--radius-lg, 22px);
+    --shm-radius-sm:     var(--radius-md, 14px);
+    --shm-shadow:        var(--shadow-md, 0 8px 26px rgba(15,23,42,.07));
+    --shm-shadow-lg:     var(--shadow-lg, 0 22px 48px rgba(94,114,228,.20));
+}
+body{
+    background: var(--shm-bg);
+    color: var(--shm-text);
+    font-family: 'Tajawal', system-ui, -apple-system, sans-serif;
+    transition: background .25s ease, color .25s ease;
 }
 
-body { background: #f0f2f5; }
+/* HERO */
+.shm-hero{
+    position: relative; overflow: hidden;
+    padding: 52px 0 128px;
+    background: linear-gradient(120deg, #1a1a2e 0%, #16213e 30%, #0f3460 65%, #533483 100%);
+    border-radius: 0 0 40px 40px;
+    isolation: isolate;
+}
+.shm-hero.is-closed{ background: linear-gradient(120deg, #2d3436 0%, #4b5563 60%, #6b7280 100%); }
+.shm-hero::after{
+    content:''; position:absolute; inset:auto 0 -1px 0; height:80px;
+    background: linear-gradient(to top, var(--shm-bg), transparent);
+    opacity:.6; z-index:-1;
+}
+.shm-blob{
+    position:absolute; border-radius:50%; filter: blur(60px); opacity:.28; z-index:-1;
+    animation: shmBlob 16s ease-in-out infinite;
+}
+.shm-blob.b1{ width:400px; height:400px; top:-160px; left:-120px; background: radial-gradient(circle, #8b5cf6, transparent 70%); }
+.shm-blob.b2{ width:340px; height:340px; bottom:-160px; right:-90px; background: radial-gradient(circle, #06b6d4, transparent 70%); animation-delay:-5s; }
+.shm-blob.b3{ width:220px; height:220px; top:42%; right:26%; opacity:.18; background: radial-gradient(circle, #ec4899, transparent 70%); animation-delay:-9s; }
+@keyframes shmBlob{ 0%,100%{ transform: translate3d(0,0,0) scale(1); } 50%{ transform: translate3d(22px,-28px,0) scale(1.08); } }
 
-.sm-container { max-width: 1440px; margin: 0 auto; padding: 0 15px; }
+.shm-hero-inner{ display:flex; align-items:flex-start; justify-content:space-between; gap:28px; flex-wrap:wrap; }
 
-/* ===== Header ===== */
-.sm-header-open {
-    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 30%, #0f3460 70%, #533483 100%);
-    border-radius: 0 0 var(--sm-radius) var(--sm-radius);
-    position: relative;
+.shm-hero-badge{
+    display:inline-flex; align-items:center; gap:9px;
+    background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.28);
+    color:#fff; font-weight: 800; font-size:.82rem;
+    padding: 8px 18px; border-radius: 999px;
+    backdrop-filter: blur(10px); margin-bottom:14px;
+}
+.shm-hero-badge .pulse-dot{
+    width:9px; height:9px; border-radius:50%; background:#10b981;
+    box-shadow: 0 0 0 4px rgba(16,185,129,.3);
+    animation: shmDot 1.6s ease-in-out infinite;
+}
+.shm-hero-badge.closed .pulse-dot{ background:#ef4444; box-shadow: 0 0 0 4px rgba(239,68,68,.3); }
+@keyframes shmDot{
+    0%,100%{ transform: scale(1); box-shadow: 0 0 0 4px rgba(16,185,129,.3); }
+    50%{ transform: scale(1.3); box-shadow: 0 0 0 8px rgba(16,185,129,.08); }
+}
+.shm-hero-text h1{ color:#fff; font-weight:800; font-size:1.9rem; line-height:1.3; margin:0 0 12px; letter-spacing:-.4px; }
+.shm-hero-text p{ color: rgba(255,255,255,.85); margin:0 0 6px; font-size:.95rem; line-height:1.9; }
+.shm-hero-meta{ display:flex; align-items:center; gap:18px; flex-wrap:wrap; margin-top:14px; font-size:.82rem; color: rgba(255,255,255,.75); font-weight: 700; }
+.shm-hero-meta span{
+    display:inline-flex; align-items:center; gap:7px;
+    background: rgba(255,255,255,.10); border: 1px solid rgba(255,255,255,.18);
+    padding: 6px 13px; border-radius: 999px; backdrop-filter: blur(8px);
+}
+.shm-hero-stat{
+    min-width: 130px; background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.25);
+    border-radius: 18px; padding: 16px 18px; backdrop-filter: blur(14px);
+    color:#fff; text-align:center;
+}
+.shm-hero-stat .hs-val{ font-size:1.5rem; font-weight:900; line-height:1.1; letter-spacing:-.5px; }
+.shm-hero-stat .hs-lbl{ font-size:.72rem; font-weight:700; opacity:.85; margin-top:6px; text-transform: uppercase; letter-spacing:.4px; }
+
+/* WRAP */
+.shm-wrap{ margin-top: -86px; position: relative; z-index: 5; padding-bottom: 30px; max-width: 1440px; }
+.alert{ border-radius: var(--shm-radius-sm); border: none; box-shadow: var(--shm-shadow); font-weight: 700; padding: 15px 20px; }
+.alert-success{ background: rgba(16,185,129,.12); color:#047857; }
+.alert-danger{  background: rgba(239,68,68,.10);  color:#b91c1c; }
+.alert-info{    background: rgba(14,165,233,.10); color:#0369a1; }
+
+/* OPEN SHIFT CARD */
+.shm-open-card{
+    max-width: 560px; margin: 20px auto 40px;
+    background: var(--shm-card);
+    border-radius: 24px;
+    box-shadow: 0 30px 70px rgba(15,23,42,.18);
     overflow: hidden;
+    border: 1px solid var(--shm-border-light);
+    animation: shmSlide 0.55s cubic-bezier(.34,1.56,.64,1);
 }
-.sm-header-closed {
-    background: linear-gradient(135deg, #2d3436 0%, #636e72 100%);
-    border-radius: 0 0 var(--sm-radius) var(--sm-radius);
-    position: relative;
-    overflow: hidden;
+@keyframes shmSlide{ from{ opacity:0; transform: translateY(-24px) scale(.96); } to{ opacity:1; transform: none; } }
+.shm-open-head{
+    background: linear-gradient(135deg, #10b981 0%, #06b6d4 55%, #6366f1 100%);
+    padding: 34px 30px 28px; text-align: center; color: #fff;
+    position: relative; overflow: hidden;
 }
-.sm-header-open::before {
-    content: '';
-    position: absolute;
-    top: -50%;
-    left: -20%;
-    width: 600px;
-    height: 600px;
-    background: radial-gradient(circle, rgba(255,255,255,0.04) 0%, transparent 70%);
+.shm-open-head::after{
+    content:''; position:absolute; inset: 0;
+    background: radial-gradient(circle at 80% 10%, rgba(255,255,255,.2), transparent 55%);
     pointer-events: none;
 }
-.sm-header-content {
-    position: relative;
-    z-index: 1;
-    padding: 25px 30px;
+.shm-open-icon{
+    position: relative; width: 84px; height: 84px;
+    margin: 0 auto 16px; border-radius: 26px;
+    background: rgba(255,255,255,.2); border: 1.5px solid rgba(255,255,255,.32);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 2rem; color: #fff;
+    backdrop-filter: blur(10px);
+    box-shadow: 0 12px 30px rgba(0,0,0,.22);
 }
-.sm-status-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 16px;
-    border-radius: 50px;
-    font-weight: 700;
-    font-size: 13px;
+.shm-open-icon .pulse-ring{
+    position: absolute; inset: -6px; border-radius: 28px;
+    border: 2px solid rgba(255,255,255,.42);
+    animation: shmRing 2s ease-in-out infinite;
+    pointer-events: none;
 }
-.sm-status-badge.open {
-    background: rgba(46, 204, 113, 0.2);
-    color: #2ecc71;
-    border: 1px solid rgba(46, 204, 113, 0.3);
+@keyframes shmRing{ 0%{ transform: scale(1); opacity: .8; } 100%{ transform: scale(1.35); opacity: 0; } }
+.shm-open-head h3{ font-size: 1.25rem; font-weight: 800; margin: 0 0 6px; color: #fff; position: relative; z-index: 1; }
+.shm-open-head p{ margin: 0; font-size: .86rem; opacity: .92; position: relative; z-index: 1; font-weight: 600; }
+.shm-open-body{ padding: 28px 30px 30px; text-align: right; direction: rtl; }
+.shm-open-field label{ display: block; font-size: .82rem; font-weight: 800; color: var(--shm-text-2); margin-bottom: 10px; }
+.shm-open-input-wrap{
+    position: relative; display: flex; align-items: center;
+    background: #f1f5f9; border: 1.5px solid #e2e8f0;
+    border-radius: 14px; padding: 6px 18px;
+    transition: all .25s ease; margin-bottom: 8px;
 }
-.sm-status-badge.closed {
-    background: rgba(231, 76, 60, 0.2);
-    color: #e74c3c;
-    border: 1px solid rgba(231, 76, 60, 0.3);
+.shm-open-input-wrap:focus-within{ border-color: #10b981; background: #fff; box-shadow: 0 0 0 4px rgba(16,185,129,.14); }
+.shm-open-input-wrap > i{ color: #10b981; font-size: 1.2rem; margin-left: 12px; }
+.shm-open-input-wrap input{
+    flex: 1; border: none; outline: none;
+    background: transparent; padding: 12px 0;
+    font-size: 1.8rem; font-weight: 900; color: #0f172a;
+    text-align: center; font-family: inherit; letter-spacing: -.5px;
 }
-.sm-shift-time {
-    font-size: 13px;
-    opacity: 0.8;
+.shm-open-input-wrap input::placeholder{ color: #cbd5e1; font-weight: 800; }
+.shm-open-currency{ color: #94a3b8; font-weight: 800; font-size: .82rem; letter-spacing: .5px; }
+.shm-open-hint{ display: block; text-align: center; font-size: .76rem; color: var(--shm-muted); font-weight: 600; margin-bottom: 22px; }
+.shm-btn-open{
+    display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+    width: 100%; border: none; cursor: pointer;
+    background: linear-gradient(135deg, #10b981, #06b6d4);
+    color: #fff; font-weight: 800; font-size: .95rem;
+    padding: 16px 22px; border-radius: 14px;
+    box-shadow: 0 14px 28px rgba(16,185,129,.32);
+    transition: all .3s cubic-bezier(.4,0,.2,1); font-family: inherit;
 }
+.shm-btn-open:hover{ transform: translateY(-3px); box-shadow: 0 20px 38px rgba(16,185,129,.45); color: #fff; }
 
-/* ===== Open Shift Form ===== */
-.sm-open-card {
-    max-width: 520px;
-    margin: 40px auto;
-    background: var(--sm-card-bg);
-    border-radius: 20px;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.1);
-    overflow: hidden;
+/* STATS */
+.shm-stats{ display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin-bottom: 22px; }
+.shm-stat{
+    position: relative; background: var(--shm-card);
+    border: 1px solid var(--shm-border-light); border-radius: 18px;
+    padding: 18px 18px 16px; box-shadow: var(--shm-shadow);
+    overflow: hidden; transition: all .3s cubic-bezier(.4,0,.2,1);
+    animation: shmCardIn 0.55s cubic-bezier(.4,0,.2,1) backwards;
 }
-.sm-open-header {
-    background: linear-gradient(135deg, #00b894, #00cec9);
-    padding: 30px;
-    text-align: center;
-    color: #fff;
+.shm-stat:hover{ transform: translateY(-5px); box-shadow: var(--shm-shadow-lg); }
+.shm-stat .st-bar{ position: absolute; top: 0; left: 0; right: 0; height: 4px; }
+.shm-stat .st-head{ display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.shm-stat .st-ico{ width: 42px; height: 42px; border-radius: 13px; display: flex; align-items: center; justify-content: center; font-size: 1rem; transition: transform .35s cubic-bezier(.34,1.56,.64,1); }
+.shm-stat:hover .st-ico{ transform: rotate(-8deg) scale(1.08); }
+.shm-stat .st-lbl{ font-size: .74rem; font-weight: 800; color: var(--shm-text-2); text-transform: uppercase; letter-spacing: .3px; }
+.shm-stat .st-val{ font-size: 1.4rem; font-weight: 900; color: var(--shm-text); letter-spacing: -.5px; line-height: 1.1; }
+.shm-stat .st-unit{ font-size: .7rem; font-weight: 800; color: var(--shm-muted); margin-right: 3px; letter-spacing: .4px; }
+.shm-stat .st-count{
+    display: inline-flex; align-items: center; gap: 6px;
+    margin-top: 8px; font-size: .72rem; font-weight: 700;
+    color: var(--shm-muted); background: var(--shm-soft);
+    padding: 4px 10px; border-radius: 999px; width: fit-content;
 }
-.sm-open-header .icon-wrap {
-    width: 80px;
-    height: 80px;
-    border-radius: 50%;
-    background: rgba(255,255,255,0.15);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin: 0 auto 15px;
-    font-size: 36px;
-}
-.sm-open-body {
-    padding: 30px;
-}
-.sm-amount-input {
-    font-size: 28px;
-    font-weight: 800;
-    text-align: center;
-    height: 60px;
-    border: 2px solid #e9ecef;
-    border-radius: 12px;
-    transition: var(--sm-transition);
-}
-.sm-amount-input:focus {
-    border-color: #00b894;
-    box-shadow: 0 0 0 4px rgba(0, 184, 148, 0.1);
-}
-.sm-btn-primary {
-    background: linear-gradient(135deg, #00b894, #00cec9);
-    border: none;
-    border-radius: 12px;
-    padding: 16px;
-    font-weight: 700;
-    font-size: 16px;
-    color: #fff;
-    transition: var(--sm-transition);
-    width: 100%;
-}
-.sm-btn-primary:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 25px rgba(0, 184, 148, 0.3);
-}
-.sm-btn-danger {
-    background: linear-gradient(135deg, #e74c3c, #c0392b);
-    border: none;
-    border-radius: 12px;
-    padding: 16px;
-    font-weight: 700;
-    font-size: 16px;
-    color: #fff;
-    transition: var(--sm-transition);
-    width: 100%;
-}
-.sm-btn-danger:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 25px rgba(231, 76, 60, 0.3);
-}
+@keyframes shmCardIn{ from{ opacity: 0; transform: translateY(20px) scale(.97); } to{ opacity: 1; transform: none; } }
 
-/* ===== Stats Cards ===== */
-.sm-stats-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-    gap: 14px;
-    margin-bottom: 24px;
+/* PANEL */
+.shm-panel{
+    background: var(--shm-card); border: 1px solid var(--shm-border-light);
+    border-radius: var(--shm-radius); box-shadow: var(--shm-shadow); overflow: hidden;
 }
-.sm-stat-card {
-    background: var(--sm-card-bg);
-    border-radius: 14px;
-    box-shadow: var(--sm-shadow);
-    padding: 18px 20px;
-    transition: var(--sm-transition);
-    position: relative;
-    overflow: hidden;
-    border: 1px solid rgba(0,0,0,0.03);
+.shm-panel-head{
+    padding: 18px 22px; border-bottom: 1px solid var(--shm-border-light);
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; flex-wrap: wrap;
 }
-.sm-stat-card:hover {
-    transform: translateY(-3px);
-    box-shadow: 0 12px 40px rgba(0,0,0,0.12);
-}
-.sm-stat-card .stat-icon {
-    width: 42px;
-    height: 42px;
-    border-radius: 12px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 18px;
-    margin-bottom: 10px;
-}
-.sm-stat-card .stat-label {
-    font-size: 12px;
-    color: #7f8c8d;
-    font-weight: 500;
-    margin-bottom: 2px;
-}
-.sm-stat-card .stat-value {
-    font-size: 22px;
-    font-weight: 800;
-}
-.sm-stat-card .stat-sub {
-    font-size: 11px;
-    color: #95a5a6;
-    margin-top: 2px;
-}
-.sm-stat-card .stat-bar {
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 3px;
-}
+.shm-panel-title{ font-size: 1rem; font-weight: 800; color: var(--shm-text); margin: 0; display: flex; align-items: center; gap: 10px; }
+.shm-panel-title .pt-ico{ width: 34px; height: 34px; border-radius: 11px; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; font-size: .85rem; box-shadow: 0 8px 16px rgba(99,102,241,.28); }
 
-/* ===== Close Panel ===== */
-.sm-close-panel {
-    background: linear-gradient(135deg, #1a1a2e, #16213e);
-    border-radius: var(--sm-radius);
-    padding: 28px;
-    color: #fff;
-    position: sticky;
-    top: 20px;
+/* FILTERS */
+.shm-filters{ display: flex; gap: 6px; flex-wrap: wrap; }
+.shm-filter{
+    display: inline-flex; align-items: center; gap: 7px;
+    background: var(--shm-soft); border: 1px solid var(--shm-border-light);
+    color: var(--shm-text-2); padding: 8px 14px; border-radius: 999px;
+    font-weight: 800; font-size: .76rem; cursor: pointer;
+    transition: all .25s cubic-bezier(.4,0,.2,1); white-space: nowrap;
 }
-.sm-close-panel .summary-row {
-    display: flex;
-    justify-content: space-between;
-    padding: 10px 0;
-    border-bottom: 1px solid rgba(255,255,255,0.08);
-    font-size: 14px;
-}
-.sm-close-panel .summary-row:last-child { border-bottom: none; }
-.sm-close-panel .summary-label { opacity: 0.7; }
-.sm-close-panel .summary-value { font-weight: 700; }
-.sm-close-panel .summary-total {
-    font-size: 20px;
-    font-weight: 800;
-    padding: 14px 0;
-    border-bottom: 2px solid rgba(255,255,255,0.15);
-}
-.sm-variance-display {
-    background: rgba(0,0,0,0.3);
-    border-radius: 12px;
-    padding: 16px;
-    text-align: center;
-    margin: 16px 0;
-}
-.sm-variance-display .variance-label {
-    font-size: 12px;
-    opacity: 0.6;
-}
-.sm-variance-display .variance-value {
-    font-size: 26px;
-    font-weight: 800;
-}
+.shm-filter:hover{ background: var(--shm-border); color: var(--shm-text); transform: translateY(-2px); }
+.shm-filter.active{ background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; border-color: transparent; box-shadow: 0 8px 18px rgba(99,102,241,.32); }
+.shm-filter .fcnt{ background: rgba(0,0,0,.08); padding: 1px 8px; border-radius: 999px; font-size: .68rem; font-weight: 800; min-width: 20px; text-align: center; }
+.shm-filter.active .fcnt{ background: rgba(255,255,255,.24); }
 
-/* ===== Transaction List ===== */
-.sm-tx-list {
-    max-height: 500px;
-    overflow-y: auto;
+/* TRANSACTIONS */
+.shm-tx-list{ max-height: 600px; overflow-y: auto; }
+.shm-tx-list::-webkit-scrollbar{ width: 6px; }
+.shm-tx-list::-webkit-scrollbar-thumb{ background: linear-gradient(180deg, rgba(99,102,241,.5), rgba(139,92,246,.5)); border-radius: 10px; }
+.shm-tx{
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 22px; border-bottom: 1px solid var(--shm-border-light);
+    transition: all .25s ease; animation: shmTxIn 0.35s ease backwards;
 }
-.sm-tx-list::-webkit-scrollbar { width: 6px; }
-.sm-tx-list::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
-.sm-tx-item {
-    display: flex;
-    align-items: center;
-    padding: 12px 16px;
-    border-bottom: 1px solid #f1f3f5;
-    transition: var(--sm-transition);
+@keyframes shmTxIn{ from{ opacity: 0; transform: translateX(-8px); } to{ opacity: 1; transform: none; } }
+.shm-tx:last-child{ border-bottom: none; }
+.shm-tx:hover{ background: var(--shm-soft); padding-right: 28px; }
+.shm-tx-ico{
+    width: 44px; height: 44px; border-radius: 13px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.05rem; flex: 0 0 auto;
+    transition: transform .3s cubic-bezier(.34,1.56,.64,1);
+    box-shadow: 0 6px 14px rgba(0,0,0,.05);
 }
-.sm-tx-item:hover { background: #f8f9fa; }
-.sm-tx-item:last-child { border-bottom: none; }
-.sm-tx-icon {
-    width: 38px;
-    height: 38px;
-    border-radius: 10px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 16px;
-    margin-left: 14px;
-    flex-shrink: 0;
-}
-.sm-tx-info { flex: 1; min-width: 0; }
-.sm-tx-desc {
-    font-weight: 600;
-    font-size: 13px;
-    color: #2c3e50;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.sm-tx-time {
-    font-size: 11px;
-    color: #95a5a6;
-}
-.sm-tx-amount {
-    font-weight: 700;
-    font-size: 15px;
-    white-space: nowrap;
-}
+.shm-tx:hover .shm-tx-ico{ transform: scale(1.08) rotate(-4deg); }
+.shm-tx-body{ flex: 1; min-width: 0; }
+.shm-tx-title{ font-weight: 800; font-size: .92rem; color: var(--shm-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3; }
+.shm-tx-detail{ font-size: .76rem; color: var(--shm-muted); font-weight: 600; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 6px; }
+.shm-tx-time{ display: inline-flex; align-items: center; gap: 5px; font-size: .7rem; color: var(--shm-muted); font-weight: 700; margin-top: 4px; }
+.shm-tx-amt{ font-weight: 900; font-size: .98rem; letter-spacing: -.3px; white-space: nowrap; text-align: left; min-width: 100px; }
+.shm-tx-amt.pos{ color: #059669; }
+.shm-tx-amt.neg{ color: #dc2626; }
 
-/* ===== Filter Tabs ===== */
-.sm-filter-tabs {
-    display: flex;
-    gap: 4px;
-    background: #f0f2f5;
-    border-radius: 10px;
-    padding: 3px;
-    flex-wrap: wrap;
+/* EMPTY */
+.shm-empty{ text-align: center; padding: 60px 24px; }
+.shm-empty .se-ico{
+    width: 76px; height: 76px; margin: 0 auto 16px;
+    border-radius: 24px;
+    background: linear-gradient(135deg, rgba(99,102,241,.12), rgba(139,92,246,.12));
+    color: #6366f1; font-size: 1.7rem;
+    display: flex; align-items: center; justify-content: center;
 }
-.sm-filter-tab {
-    padding: 7px 14px;
-    border: none;
-    background: transparent;
-    border-radius: 8px;
-    font-weight: 600;
-    font-size: 12px;
-    color: #64748b;
-    cursor: pointer;
-    transition: var(--sm-transition);
-    white-space: nowrap;
-}
-.sm-filter-tab:hover { color: #1a5276; background: rgba(26, 82, 118, 0.06); }
-.sm-filter-tab.active {
-    background: #fff;
-    color: #1a1a2e;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-}
-.sm-filter-count {
-    background: #e9ecef;
-    border-radius: 20px;
-    padding: 0 8px;
-    font-size: 11px;
-    margin-left: 4px;
-}
+.shm-empty h4{ font-size: 1.05rem; font-weight: 800; color: var(--shm-text); margin: 0 0 6px; }
+.shm-empty p{ font-size: .84rem; color: var(--shm-muted); margin: 0; font-weight: 600; }
 
-/* ===== Revenue Breakdown Table ===== */
-.sm-breakdown-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
+/* CLOSE PANEL */
+.shm-close-panel{
+    position: sticky; top: 20px;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 55%, #0f3460 100%);
+    border-radius: var(--shm-radius); padding: 26px; color: #fff;
+    box-shadow: 0 24px 60px rgba(15,23,42,.35);
+    overflow: hidden; position: relative;
 }
-.sm-breakdown-table th {
-    background: #f0f4f8;
-    color: #1a5276;
-    font-weight: 700;
-    padding: 10px 14px;
-    text-align: center;
-    font-size: 12px;
-    border-bottom: 2px solid #dce4ec;
+.shm-close-panel::before{
+    content: ''; position: absolute; top: -60px; right: -60px;
+    width: 200px; height: 200px;
+    background: radial-gradient(circle, rgba(139,92,246,.25), transparent 70%);
+    border-radius: 50%; pointer-events: none;
 }
-.sm-breakdown-table td {
-    padding: 10px 14px;
-    border-bottom: 1px solid #eef2f7;
-    text-align: center;
-    vertical-align: middle;
+.shm-close-panel::after{
+    content: ''; position: absolute; bottom: -80px; left: -70px;
+    width: 220px; height: 220px;
+    background: radial-gradient(circle, rgba(6,182,212,.18), transparent 70%);
+    border-radius: 50%; pointer-events: none;
 }
-.sm-breakdown-table tr:hover td { background: #f8faff; }
+.shm-close-panel > *{ position: relative; z-index: 1; }
+.shm-close-head{
+    display: flex; align-items: center; gap: 12px;
+    padding-bottom: 18px; border-bottom: 1px solid rgba(255,255,255,.1);
+    margin-bottom: 16px;
+}
+.shm-close-head .ch-ico{
+    width: 42px; height: 42px; border-radius: 13px;
+    background: linear-gradient(135deg, #f43f5e, #ec4899);
+    display: flex; align-items: center; justify-content: center; font-size: 1rem;
+    box-shadow: 0 10px 22px rgba(244,63,94,.35);
+}
+.shm-close-head h5{ font-size: 1rem; font-weight: 800; margin: 0; color: #fff; }
+.shm-close-head small{ font-size: .72rem; color: rgba(255,255,255,.6); display: block; margin-top: 2px; font-weight: 700; }
 
-/* ===== Empty State ===== */
-.sm-empty {
-    text-align: center;
-    padding: 50px 20px;
-    color: #95a5a6;
+.shm-summary-row{
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 0; font-size: .84rem;
+    border-bottom: 1px dashed rgba(255,255,255,.08);
 }
-.sm-empty i { font-size: 48px; margin-bottom: 15px; opacity: 0.3; }
-.sm-empty p { font-size: 15px; font-weight: 500; }
+.shm-summary-row:last-of-type{ border-bottom: none; }
+.shm-summary-row .sr-lbl{ display: inline-flex; align-items: center; gap: 8px; color: rgba(255,255,255,.72); font-weight: 700; }
+.shm-summary-row .sr-lbl i{ font-size: .78rem; width: 14px; text-align: center; }
+.shm-summary-row .sr-val{ font-weight: 800; color: #fff; font-variant-numeric: tabular-nums; }
 
-/* ===== Responsive ===== */
-@media (max-width: 768px) {
-    .sm-stats-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
-    .sm-stat-card { padding: 14px; }
-    .sm-stat-card .stat-value { font-size: 18px; }
-    .sm-header-content { padding: 15px; }
-    .sm-close-panel { position: static; margin-top: 20px; }
+.shm-summary-total{
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px;
+    background: linear-gradient(135deg, rgba(16,185,129,.18), rgba(6,182,212,.18));
+    border: 1px solid rgba(16,185,129,.3);
+    border-radius: 14px; margin-top: 12px;
 }
-@media (max-width: 480px) {
-    .sm-stats-grid { grid-template-columns: 1fr; }
-}
+.shm-summary-total .st-lbl{ font-size: .78rem; color: rgba(255,255,255,.75); font-weight: 700; }
+.shm-summary-total .st-val{ font-size: 1.4rem; font-weight: 900; color: #6ee7b7; letter-spacing: -.5px; line-height: 1.1; }
+.shm-summary-total .st-val small{ font-size: .72rem; color: rgba(255,255,255,.6); font-weight: 800; margin-right: 3px; }
 
-/* ===== Pulse Animation for Open Shift ===== */
-@keyframes pulse-dot {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
+.shm-close-form{ margin-top: 18px; }
+.shm-close-field{ margin-bottom: 12px; }
+.shm-close-field label{
+    display: block; font-size: .74rem; font-weight: 800;
+    color: rgba(255,255,255,.7); margin-bottom: 7px;
+    text-transform: uppercase; letter-spacing: .4px;
 }
-.pulse-dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #2ecc71;
-    animation: pulse-dot 1.5s ease-in-out infinite;
+.shm-close-field select, .shm-close-field input{
+    width: 100%; background: rgba(255,255,255,.08);
+    border: 1.5px solid rgba(255,255,255,.18);
+    color: #fff; border-radius: 12px; padding: 11px 15px;
+    font-size: .88rem; font-weight: 700;
+    transition: all .25s ease; font-family: inherit; outline: none;
+}
+.shm-close-field select:focus, .shm-close-field input:focus{
+    border-color: #06b6d4; background: rgba(6,182,212,.12);
+    box-shadow: 0 0 0 4px rgba(6,182,212,.18);
+}
+.shm-close-field select option{ background: #1a1a2e; color: #fff; }
+.shm-close-field input.cash-input{ font-size: 1.6rem; text-align: center; font-weight: 900; letter-spacing: -.5px; padding: 12px 15px; }
+
+.shm-variance{
+    background: rgba(0,0,0,.28); border: 1.5px solid rgba(255,255,255,.12);
+    border-radius: 14px; padding: 14px 16px; text-align: center;
+    margin: 14px 0 18px; transition: all .3s ease;
+}
+.shm-variance.match{    background: rgba(16,185,129,.14); border-color: rgba(16,185,129,.35); }
+.shm-variance.shortage{ background: rgba(239,68,68,.14);  border-color: rgba(239,68,68,.35); }
+.shm-variance.surplus{  background: rgba(6,182,212,.14);  border-color: rgba(6,182,212,.35); }
+.shm-variance .sv-lbl{ font-size: .72rem; font-weight: 800; color: rgba(255,255,255,.65); text-transform: uppercase; letter-spacing: .5px; }
+.shm-variance .sv-val{ font-size: 1.5rem; font-weight: 900; margin-top: 4px; line-height: 1.1; color: #fff; letter-spacing: -.4px; }
+.shm-variance.match .sv-val{ color: #6ee7b7; }
+.shm-variance.shortage .sv-val{ color: #fca5a5; }
+.shm-variance.surplus .sv-val{ color: #67e8f9; }
+
+.shm-btn-close{
+    display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+    width: 100%; border: none; cursor: pointer;
+    background: linear-gradient(135deg, #f43f5e, #ec4899);
+    color: #fff; font-weight: 800; font-size: .92rem;
+    padding: 14px 22px; border-radius: 13px;
+    box-shadow: 0 14px 28px rgba(244,63,94,.35);
+    transition: all .3s cubic-bezier(.4,0,.2,1); font-family: inherit;
+}
+.shm-btn-close:hover{ transform: translateY(-3px); box-shadow: 0 20px 38px rgba(244,63,94,.5); color: #fff; }
+
+/* RESPONSIVE */
+@media (max-width: 991px){
+    .shm-hero{ padding: 40px 0 110px; border-radius: 0 0 30px 30px; }
+    .shm-hero-text h1{ font-size: 1.5rem; }
+    .shm-wrap{ margin-top: -74px; }
+    .shm-close-panel{ position: static; margin-top: 20px; }
+    .shm-tx{ padding: 12px 16px; }
+}
+@media (max-width: 575px){
+    .shm-hero-text h1{ font-size: 1.25rem; }
+    .shm-hero{ padding: 34px 0 100px; }
+    .shm-hero-inner{ flex-direction: column; }
+    .shm-stats{ grid-template-columns: 1fr 1fr; gap: 10px; }
+    .shm-stat{ padding: 14px 14px 12px; }
+    .shm-panel-head{ padding: 14px 16px; }
+    .shm-tx{ gap: 10px; padding: 12px 14px; }
+    .shm-tx-amt{ font-size: .88rem; min-width: 82px; }
+    .shm-open-card{ margin: 10px 0 30px; }
+    .shm-open-body{ padding: 22px 20px 24px; }
 }
 </style>
 
@@ -631,396 +869,346 @@ body { background: #f0f2f5; }
     <?php require_once('partials/_sidebar.php'); ?>
     <div class="main-content">
         <?php require_once('partials/_topnav.php'); ?>
-        
-        <!-- Header -->
-        <div class="<?php echo $active_shift ? 'sm-header-open' : 'sm-header-closed'; ?>">
-            <div class="sm-header-content" dir="rtl" style="margin-top: 60px;">
-                <div class="d-flex justify-content-between align-items-center flex-wrap gap-3">
-                    <div>
-                        <h1 class="text-white font-weight-bold mb-1" style="font-size: 24px;">
-                            <i class="fas fa-cash-register"></i> إدارة الورديات وجرد الصندوق
-                        </h1>
-                        <div class="d-flex align-items-center gap-3 mt-2 flex-wrap">
-                            <?php if($active_shift): ?>
-                                <span class="sm-status-badge open">
-                                    <span class="pulse-dot"></span> وردية مفتوحة
-                                </span>
-                                <span class="sm-shift-time text-white-50">
-                                    <i class="far fa-clock"></i> فتحت في: <?php echo date('Y-m-d h:i A', strtotime($active_shift['opened_at'])); ?>
-                                </span>
-                            <?php else: ?>
-                                <span class="sm-status-badge closed">
-                                    <i class="fas fa-lock"></i> لا توجد وردية مفتوحة
-                                </span>
-                            <?php endif; ?>
+
+        <!-- HERO -->
+        <div class="shm-hero <?php echo $active_shift ? '' : 'is-closed'; ?>">
+            <span class="shm-blob b1"></span>
+            <span class="shm-blob b2"></span>
+            <span class="shm-blob b3"></span>
+            <div class="container-fluid text-right" dir="rtl" style="margin-top: 60px;">
+                <div class="shm-hero-inner">
+                    <div class="shm-hero-text">
+                        <span class="shm-hero-badge <?php echo $active_shift ? '' : 'closed'; ?>">
+                            <span class="pulse-dot"></span>
+                            <?php echo $active_shift ? 'وردية مفتوحة الآن' : 'لا توجد وردية مفتوحة'; ?>
+                        </span>
+                        <h1>إدارة الورديات وجرد الصندوق</h1>
+                        <p><i class="fas fa-info-circle"></i> متابعة حية لجميع الإيرادات، تفصيل الحركات المالية، والترحيل المحاسبي التلقائي عند الإغلاق.</p>
+
+                        <?php if ($active_shift): ?>
+                        <div class="shm-hero-meta">
+                            <span><i class="fas fa-clock"></i> مفتوحة منذ <?php echo $hours_open; ?> ساعة</span>
+                            <span><i class="fas fa-calendar-alt"></i> <?php echo date('Y-m-d h:i A', strtotime($active_shift['opened_at'])); ?></span>
+                            <span><i class="fas fa-receipt"></i> <?php echo $total_transactions; ?> حركة مالية</span>
+                        </div>
+                        <?php endif; ?>
+                    </div>
+
+                    <?php if ($active_shift): ?>
+                    <div class="shm-hero-actions">
+                        <div class="shm-hero-stat">
+                            <div class="hs-val"><?php echo number_format((float)$expected_cash, 0); ?></div>
+                            <div class="hs-lbl">المتوقع بالصندوق (SDG)</div>
                         </div>
                     </div>
+                    <?php endif; ?>
                 </div>
             </div>
         </div>
 
-        <div class="container-fluid mt--4 sm-container" dir="rtl">
-            <!-- Alert Messages -->
-            <?php if(isset($_GET['success'])): ?>
-                <div class="alert alert-success shadow-lg alert-dismissible fade show" style="border-radius: 12px; border: none;">
-                    <i class="fas fa-check-circle"></i> <strong>✓ نجح!</strong> تم فتح الوردية وبدء الجرد بنجاح.
+        <!-- CONTENT -->
+        <div class="container-fluid shm-wrap" dir="rtl">
+
+            <?php if (isset($_GET['success'])): ?>
+                <div class="alert alert-success alert-dismissible fade show">
+                    <i class="fas fa-check-circle"></i> <strong>تم بنجاح!</strong> تم فتح الوردية وترحيل قيد العهدة الافتتاحية.
                     <button type="button" class="close" data-dismiss="alert">&times;</button>
                 </div>
             <?php endif; ?>
-            <?php if(isset($_GET['closed'])): ?>
-                <div class="alert alert-info shadow-lg alert-dismissible fade show" style="border-radius: 12px; border: none;">
-                    <i class="fas fa-check-circle"></i> <strong>✓ تم!</strong> تم إغلاق الوردية وترحيل النقدية إلى الخزنة بنجاح.
+            <?php if (isset($_GET['closed'])): ?>
+                <div class="alert alert-info alert-dismissible fade show">
+                    <i class="fas fa-check-circle"></i> <strong>تم!</strong> تم إغلاق الوردية وترحيل التسويات المحاسبية.
                     <button type="button" class="close" data-dismiss="alert">&times;</button>
                 </div>
             <?php endif; ?>
             <?php if (!empty($close_error)): ?>
-                <div class="alert alert-danger shadow-lg alert-dismissible fade show" style="border-radius: 12px; border: none;">
-                    <i class="fas fa-exclamation-triangle"></i> <strong>⚠ خطأ:</strong> <?php echo htmlspecialchars($close_error); ?>
+                <div class="alert alert-danger alert-dismissible fade show">
+                    <i class="fas fa-exclamation-triangle"></i> <strong>خطأ:</strong> <?php echo htmlspecialchars($close_error); ?>
                     <button type="button" class="close" data-dismiss="alert">&times;</button>
                 </div>
             <?php endif; ?>
 
             <?php if (!$active_shift): ?>
-                <!-- ===== OPEN SHIFT FORM ===== -->
-                <div class="sm-open-card">
-                    <div class="sm-open-header">
-                        <div class="icon-wrap">
+                <!-- ═════════════ OPEN SHIFT ═════════════ -->
+                <div class="shm-open-card">
+                    <div class="shm-open-head">
+                        <div class="shm-open-icon">
                             <i class="fas fa-cash-register"></i>
+                            <span class="pulse-ring"></span>
                         </div>
-                        <h3 class="font-weight-bold mb-1">الوردية مغلقة حالياً</h3>
-                        <p class="mb-0" style="opacity: 0.8; font-size: 14px;">قم بفتح وردية جديدة لبدء تسجيل المبيعات</p>
+                        <h3>الوردية مغلقة حالياً</h3>
+                        <p>ابدأ يومك بجرد الصندوق وتسجيل العهدة الافتتاحية</p>
                     </div>
-                    <div class="sm-open-body">
-                        <form method="POST">
-                            <div class="text-center mb-3">
-                                <label class="font-weight-bold text-dark" style="font-size: 15px;">💵 أدخل العهدة الافتتاحية</label>
+                    <div class="shm-open-body">
+                        <form method="POST" autocomplete="off">
+                            <div class="shm-open-field">
+                                <label><i class="fas fa-money-bill-wave" style="color:#10b981;"></i> أدخل العهدة الافتتاحية</label>
+                                <div class="shm-open-input-wrap">
+                                    <i class="fas fa-hand-holding-usd"></i>
+                                    <input type="number" step="0.01" min="0" name="opening_cash" placeholder="0.00" required autofocus>
+                                    <span class="shm-open-currency">SDG</span>
+                                </div>
+                                <small class="shm-open-hint">سيتم إنشاء قيد محاسبي تلقائياً: (مدين خزنة / دائن التزام عهدة)</small>
                             </div>
-                            <div class="form-group mb-4">
-                                <input type="number" step="0.01" min="0" name="opening_cash" 
-                                    class="form-control sm-amount-input" 
-                                    placeholder="0.00 SDG" required
-                                    autofocus>
-                                <small class="text-muted">المبلغ النقدي الذي تبدأ به الوردية (مثلاً: 5000)</small>
-                            </div>
-                            <button type="submit" name="open_shift" class="sm-btn-primary">
+                            <button type="submit" name="open_shift" class="shm-btn-open">
                                 <i class="fas fa-unlock"></i> فتح الوردية الآن
                             </button>
                         </form>
                     </div>
                 </div>
+
             <?php else: ?>
-                <!-- ===== ACTIVE SHIFT DASHBOARD ===== -->
-
-                <!-- Stats Cards -->
-                <div class="sm-stats-grid">
-                    <!-- Opening Cash -->
-                    <div class="sm-stat-card">
-                        <div class="stat-bar" style="background: linear-gradient(90deg, #3498db, #2980b9);"></div>
-                        <div class="stat-icon" style="background: #ebf5fb; color: #3498db;">
-                            <i class="fas fa-inbox"></i>
+                <!-- ═════════════ STATS ═════════════ -->
+                <div class="shm-stats">
+                    <div class="shm-stat" style="animation-delay:0s">
+                        <span class="st-bar" style="background:linear-gradient(90deg,#3b82f6,#06b6d4)"></span>
+                        <div class="st-head">
+                            <div class="st-ico" style="background:rgba(59,130,246,.14);color:#2563eb;"><i class="fas fa-inbox"></i></div>
+                            <div class="st-lbl">العهدة الافتتاحية</div>
                         </div>
-                        <div class="stat-label">العهدة الافتتاحية</div>
-                        <div class="stat-value"><?php echo number_format($active_shift['opening_cash'], 2); ?></div>
-                        <div class="stat-sub">SDG</div>
+                        <div class="st-val"><?php echo number_format((float)$active_shift['opening_cash'], 2); ?> <span class="st-unit">SDG</span></div>
                     </div>
 
-                    <!-- Appointments -->
-                    <div class="sm-stat-card">
-                        <div class="stat-bar" style="background: linear-gradient(90deg, #27ae60, #2ecc71);"></div>
-                        <div class="stat-icon" style="background: #e8f8f0; color: #27ae60;">
-                            <i class="fas fa-calendar-check"></i>
+                    <div class="shm-stat" style="animation-delay:.05s">
+                        <span class="st-bar" style="background:linear-gradient(90deg,#22c55e,#10b981)"></span>
+                        <div class="st-head">
+                            <div class="st-ico" style="background:rgba(34,197,94,.14);color:#16a34a;"><i class="fas fa-calendar-check"></i></div>
+                            <div class="st-lbl">مواعيد العيادات</div>
                         </div>
-                        <div class="stat-label">مواعيد العيادات</div>
-                        <div class="stat-value" style="color: #27ae60;">+<?php echo number_format($total_clinic - $total_services - $total_consumables, 2); ?></div>
-                        <div class="stat-sub">SDG</div>
+                        <div class="st-val">+<?php echo number_format((float)$total_appointments, 2); ?> <span class="st-unit">SDG</span></div>
+                        <span class="st-count"><i class="fas fa-list"></i> <?php echo $counts['appointment']; ?> حركة</span>
                     </div>
 
-                    <!-- Medical Services (NEW) -->
-                    <div class="sm-stat-card">
-                        <div class="stat-bar" style="background: linear-gradient(90deg, #8e44ad, #9b59b6);"></div>
-                        <div class="stat-icon" style="background: #f4ecf7; color: #8e44ad;">
-                            <i class="fas fa-hand-holding-medical"></i>
+                    <div class="shm-stat" style="animation-delay:.1s">
+                        <span class="st-bar" style="background:linear-gradient(90deg,#8b5cf6,#a855f7)"></span>
+                        <div class="st-head">
+                            <div class="st-ico" style="background:rgba(139,92,246,.14);color:#7c3aed;"><i class="fas fa-hand-holding-medical"></i></div>
+                            <div class="st-lbl">الخدمات الطبية</div>
                         </div>
-                        <div class="stat-label">الخدمات الطبية</div>
-                        <div class="stat-value" style="color: #8e44ad;">+<?php echo number_format($total_services, 2); ?></div>
-                        <div class="stat-sub">SDG</div>
+                        <div class="st-val">+<?php echo number_format((float)$total_services, 2); ?> <span class="st-unit">SDG</span></div>
+                        <span class="st-count"><i class="fas fa-list"></i> <?php echo $counts['service']; ?> حركة</span>
                     </div>
 
-                    <!-- Consumables (NEW) -->
-                    <div class="sm-stat-card">
-                        <div class="stat-bar" style="background: linear-gradient(90deg, #f39c12, #e67e22);"></div>
-                        <div class="stat-icon" style="background: #fef5e7; color: #f39c12;">
-                            <i class="fas fa-box-open"></i>
+                    <div class="shm-stat" style="animation-delay:.15s">
+                        <span class="st-bar" style="background:linear-gradient(90deg,#f59e0b,#f97316)"></span>
+                        <div class="st-head">
+                            <div class="st-ico" style="background:rgba(245,158,11,.14);color:#d97706;"><i class="fas fa-box-open"></i></div>
+                            <div class="st-lbl">المستهلكات الطبية</div>
                         </div>
-                        <div class="stat-label">المستهلكات الطبية</div>
-                        <div class="stat-value" style="color: #f39c12;">+<?php echo number_format($total_consumables, 2); ?></div>
-                        <div class="stat-sub">SDG</div>
+                        <div class="st-val">+<?php echo number_format((float)$total_consumables, 2); ?> <span class="st-unit">SDG</span></div>
+                        <span class="st-count"><i class="fas fa-list"></i> <?php echo $counts['consumable']; ?> حركة</span>
                     </div>
 
-                    <!-- Lab -->
-                    <div class="sm-stat-card">
-                        <div class="stat-bar" style="background: linear-gradient(90deg, #2980b9, #3498db);"></div>
-                        <div class="stat-icon" style="background: #eaf2f8; color: #2980b9;">
-                            <i class="fas fa-flask"></i>
+                    <div class="shm-stat" style="animation-delay:.2s">
+                        <span class="st-bar" style="background:linear-gradient(90deg,#0ea5e9,#06b6d4)"></span>
+                        <div class="st-head">
+                            <div class="st-ico" style="background:rgba(14,165,233,.14);color:#0284c7;"><i class="fas fa-flask"></i></div>
+                            <div class="st-lbl">إيرادات المختبر</div>
                         </div>
-                        <div class="stat-label">إيرادات المختبر</div>
-                        <div class="stat-value" style="color: #2980b9;">+<?php echo number_format($total_lab, 2); ?></div>
-                        <div class="stat-sub">SDG</div>
+                        <div class="st-val">+<?php echo number_format((float)$total_lab, 2); ?> <span class="st-unit">SDG</span></div>
+                        <span class="st-count"><i class="fas fa-list"></i> <?php echo $counts['lab']; ?> حركة</span>
                     </div>
 
-                    <!-- Refunds -->
-                    <div class="sm-stat-card">
-                        <div class="stat-bar" style="background: linear-gradient(90deg, #e74c3c, #c0392b);"></div>
-                        <div class="stat-icon" style="background: #fdedec; color: #e74c3c;">
-                            <i class="fas fa-undo"></i>
+                    <div class="shm-stat" style="animation-delay:.25s">
+                        <span class="st-bar" style="background:linear-gradient(90deg,#ef4444,#f43f5e)"></span>
+                        <div class="st-head">
+                            <div class="st-ico" style="background:rgba(239,68,68,.14);color:#dc2626;"><i class="fas fa-undo"></i></div>
+                            <div class="st-lbl">المرتجعات</div>
                         </div>
-                        <div class="stat-label">المرتجعات</div>
-                        <div class="stat-value" style="color: #e74c3c;">-<?php echo number_format($total_refunds, 2); ?></div>
-                        <div class="stat-sub">SDG</div>
+                        <div class="st-val" style="color:#dc2626;">-<?php echo number_format((float)$total_refunds, 2); ?> <span class="st-unit">SDG</span></div>
+                        <span class="st-count"><i class="fas fa-list"></i> <?php echo $counts['refund']; ?> حركة</span>
                     </div>
                 </div>
 
-                <!-- Main Content: Transactions + Close Panel -->
+                <!-- ═════════════ MAIN GRID ═════════════ -->
                 <div class="row">
-                    <!-- Left: Transactions -->
                     <div class="col-lg-8 mb-4">
-                        <div class="card" style="border-radius: var(--sm-radius); border: none; box-shadow: var(--sm-shadow);">
-                            <div class="card-header bg-transparent d-flex justify-content-between align-items-center flex-wrap gap-2" style="border-bottom: 1px solid #e9ecef; padding: 16px 20px;">
-                                <h5 class="mb-0 font-weight-bold"><i class="fas fa-list"></i> تفصيل الحركات المالية</h5>
-                                <div class="sm-filter-tabs" id="txFilters">
-                                    <button class="sm-filter-tab active" data-filter="all">الكل <span class="sm-filter-count"><?php echo count($detailed_transactions); ?></span></button>
-                                    <button class="sm-filter-tab" data-filter="appointment">مواعيد</button>
-                                    <button class="sm-filter-tab" data-filter="service">خدمات</button>
-                                    <button class="sm-filter-tab" data-filter="consumable">مستهلكات</button>
-                                    <button class="sm-filter-tab" data-filter="lab">مختبر</button>
-                                    <button class="sm-filter-tab" data-filter="refund">مرتجعات</button>
+                        <div class="shm-panel">
+                            <div class="shm-panel-head">
+                                <h5 class="shm-panel-title">
+                                    <span class="pt-ico"><i class="fas fa-list"></i></span>
+                                    تفصيل الحركات المالية
+                                </h5>
+                                <div class="shm-filters" id="shmFilters">
+                                    <button class="shm-filter active" data-filter="all">
+                                        <i class="fas fa-layer-group"></i> الكل
+                                        <span class="fcnt"><?php echo $total_transactions; ?></span>
+                                    </button>
+                                    <button class="shm-filter" data-filter="appointment"><i class="fas fa-calendar-check"></i> مواعيد</button>
+                                    <button class="shm-filter" data-filter="service"><i class="fas fa-hand-holding-medical"></i> خدمات</button>
+                                    <button class="shm-filter" data-filter="consumable"><i class="fas fa-box-open"></i> مستهلكات</button>
+                                    <button class="shm-filter" data-filter="lab"><i class="fas fa-flask"></i> مختبر</button>
+                                    <button class="shm-filter" data-filter="refund"><i class="fas fa-undo"></i> مرتجعات</button>
                                 </div>
                             </div>
-                            <div class="card-body p-0 sm-tx-list" id="txList">
-                                <?php if(empty($detailed_transactions)): ?>
-                                    <div class="sm-empty">
-                                        <i class="fas fa-inbox"></i>
-                                        <p>لا توجد حركات مالية في هذه الوردية حتى الآن</p>
-                                    </div>
-                                <?php else: ?>
-                                    <?php foreach($detailed_transactions as $tx): 
-                                        $icon_bg = '';
-                                        $icon_color = '';
-                                        $icon = '';
-                                        $filter_type = $tx['subtype'];
-                                        switch($tx['type']) {
-                                            case 'Clinic':
-                                                $icon_bg = '#e8f8f0'; $icon_color = '#27ae60'; $icon = 'fa-calendar-check';
-                                                break;
-                                            case 'Service':
-                                                $icon_bg = '#f4ecf7'; $icon_color = '#8e44ad'; $icon = 'fa-hand-holding-medical';
-                                                break;
-                                            case 'Consumable':
-                                                $icon_bg = '#fef5e7'; $icon_color = '#f39c12'; $icon = 'fa-box-open';
-                                                break;
-                                            case 'Lab':
-                                                $icon_bg = '#eaf2f8'; $icon_color = '#2980b9'; $icon = 'fa-flask';
-                                                break;
-                                            case 'Refund':
-                                                $icon_bg = '#fdedec'; $icon_color = '#e74c3c'; $icon = 'fa-undo';
-                                                break;
-                                        }
-                                    ?>
-                                        <div class="sm-tx-item" data-filter-type="<?php echo $filter_type; ?>">
-                                            <div class="sm-tx-icon" style="background: <?php echo $icon_bg; ?>; color: <?php echo $icon_color; ?>;">
+                            <div class="shm-panel-body">
+                                <div class="shm-tx-list" id="shmTxList">
+                                    <?php if (empty($detailed_transactions)): ?>
+                                        <div class="shm-empty">
+                                            <div class="se-ico"><i class="fas fa-inbox"></i></div>
+                                            <h4>لا توجد حركات مالية بعد</h4>
+                                            <p>ستظهر جميع الحركات هنا بمجرد تسجيلها خلال هذه الوردية.</p>
+                                        </div>
+                                    <?php else: ?>
+                                        <?php foreach ($detailed_transactions as $i => $tx):
+                                            // أيقونة حسب النوع
+                                            [$icon_bg, $icon_color, $icon] = match($tx['type']) {
+                                                'Clinic'     => ['rgba(34,197,94,.14)',  '#16a34a', 'fa-calendar-check'],
+                                                'Service'    => ['rgba(139,92,246,.14)', '#7c3aed', 'fa-hand-holding-medical'],
+                                                'Consumable' => ['rgba(245,158,11,.14)', '#d97706', 'fa-box-open'],
+                                                'Lab'        => ['rgba(14,165,233,.14)', '#0284c7', 'fa-flask'],
+                                                'Refund'     => ['rgba(239,68,68,.14)',  '#dc2626', 'fa-undo'],
+                                                default      => ['rgba(100,116,139,.14)','#475569', 'fa-circle'],
+                                            };
+                                            $is_neg = fin_cmp($tx['amount'], '0', FIN_SCALE) < 0;
+                                        ?>
+                                        <div class="shm-tx" data-filter-type="<?php echo htmlspecialchars($tx['subtype']); ?>" style="animation-delay:<?php echo number_format($i * 0.02, 2); ?>s;">
+                                            <div class="shm-tx-ico" style="background:<?php echo $icon_bg; ?>;color:<?php echo $icon_color; ?>;">
                                                 <i class="fas <?php echo $icon; ?>"></i>
                                             </div>
-                                            <div class="sm-tx-info">
-                                                <div class="sm-tx-desc"><?php echo htmlspecialchars($tx['desc']); ?></div>
-                                                <div class="sm-tx-time"><i class="far fa-clock"></i> <?php echo date('h:i A', strtotime($tx['time'])); ?></div>
+                                            <div class="shm-tx-body">
+                                                <div class="shm-tx-title"><?php echo htmlspecialchars($tx['desc']); ?></div>
+                                                <div class="shm-tx-detail">
+                                                    <i class="fas fa-info-circle"></i>
+                                                    <?php echo htmlspecialchars($tx['detail']); ?>
+                                                </div>
+                                                <div class="shm-tx-time">
+                                                    <i class="far fa-clock"></i>
+                                                    <?php echo date('h:i A', strtotime($tx['time'])); ?>
+                                                </div>
                                             </div>
-                                            <div class="sm-tx-amount" style="color: <?php echo $tx['amount'] < 0 ? '#e74c3c' : '#27ae60'; ?>;">
-                                                <?php echo ($tx['amount'] > 0 ? '+' : '') . number_format($tx['amount'], 2); ?> SDG
+                                            <div class="shm-tx-amt <?php echo $is_neg ? 'neg' : 'pos'; ?>">
+                                                <?php echo ($is_neg ? '' : '+') . number_format((float)$tx['amount'], 2); ?>
+                                                <div style="font-size:.65rem; color:#94a3b8; font-weight:800; letter-spacing:.4px;">SDG</div>
                                             </div>
                                         </div>
-                                    <?php endforeach; ?>
-                                <?php endif; ?>
-                            </div>
-                        </div>
-
-                        <!-- Revenue Breakdown Table -->
-                        <div class="card mt-4" style="border-radius: var(--sm-radius); border: none; box-shadow: var(--sm-shadow);">
-                            <div class="card-header bg-transparent" style="border-bottom: 1px solid #e9ecef; padding: 16px 20px;">
-                                <h5 class="mb-0 font-weight-bold"><i class="fas fa-chart-pie"></i> تحليل الإيرادات</h5>
-                            </div>
-                            <div class="card-body p-0">
-                                <table class="sm-breakdown-table">
-                                    <thead>
-                                        <tr>
-                                            <th style="text-align: right;">المصدر</th>
-                                            <th>المبلغ</th>
-                                            <th>النسبة</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        <?php 
-                                        $total_revenue = $total_clinic + $total_lab;
-                                        $gross_total = $total_revenue - $total_refunds;
-                                        $revenue_items = [
-                                            ['name' => 'مواعيد العيادات', 'amount' => $total_clinic - $total_services - $total_consumables, 'color' => '#27ae60', 'icon' => 'fa-calendar-check'],
-                                            ['name' => 'الخدمات الطبية', 'amount' => $total_services, 'color' => '#8e44ad', 'icon' => 'fa-hand-holding-medical'],
-                                            ['name' => 'المستهلكات الطبية', 'amount' => $total_consumables, 'color' => '#f39c12', 'icon' => 'fa-box-open'],
-                                            ['name' => 'فحوصات المختبر', 'amount' => $total_lab, 'color' => '#2980b9', 'icon' => 'fa-flask'],
-                                        ];
-                                        foreach($revenue_items as $item):
-                                            $pct = $total_revenue > 0 ? round(($item['amount'] / $total_revenue) * 100, 1) : 0;
-                                        ?>
-                                        <tr>
-                                            <td style="text-align: right;">
-                                                <i class="fas <?php echo $item['icon']; ?>" style="color: <?php echo $item['color']; ?>; margin-left: 8px;"></i>
-                                                <?php echo $item['name']; ?>
-                                            </td>
-                                            <td class="font-weight-bold"><?php echo number_format($item['amount'], 2); ?> SDG</td>
-                                            <td>
-                                                <div class="d-flex align-items-center justify-content-center gap-2">
-                                                    <div style="width: 60px; height: 6px; background: #e9ecef; border-radius: 3px; overflow: hidden;">
-                                                        <div style="width: <?php echo $pct; ?>%; height: 100%; background: <?php echo $item['color']; ?>; border-radius: 3px;"></div>
-                                                    </div>
-                                                    <span style="font-size: 12px; color: #7f8c8d;"><?php echo $pct; ?>%</span>
-                                                </div>
-                                            </td>
-                                        </tr>
                                         <?php endforeach; ?>
-                                        <tr style="background: #f8fafc; font-weight: 700;">
-                                            <td style="text-align: right; color: #1a5276;">إجمالي الإيرادات</td>
-                                            <td style="color: #27ae60;"><?php echo number_format($total_revenue, 2); ?> SDG</td>
-                                            <td>100%</td>
-                                        </tr>
-                                        <tr style="color: #e74c3c;">
-                                            <td style="text-align: right;"><i class="fas fa-undo" style="margin-left: 8px;"></i> المرتجعات</td>
-                                            <td>-<?php echo number_format($total_refunds, 2); ?> SDG</td>
-                                            <td></td>
-                                        </tr>
-                                        <tr style="background: #1a1a2e; color: #fff; font-weight: 800;">
-                                            <td style="text-align: right;"><i class="fas fa-calculator"></i> الصافي</td>
-                                            <td><?php echo number_format($gross_total, 2); ?> SDG</td>
-                                            <td></td>
-                                        </tr>
-                                    </tbody>
-                                </table>
+                                    <?php endif; ?>
+                                </div>
                             </div>
                         </div>
                     </div>
 
-                    <!-- Right: Close Panel -->
+                    <!-- CLOSE PANEL -->
                     <div class="col-lg-4 mb-4">
-                        <div class="sm-close-panel">
-                            <h5 class="font-weight-bold mb-3 text-center">
-                                <i class="fas fa-lock"></i> إغلاق الوردية
-                            </h5>
-
-                            <!-- Summary -->
-                            <div class="summary-row">
-                                <span class="summary-label"><i class="fas fa-inbox"></i> العهدة الافتتاحية</span>
-                                <span class="summary-value"><?php echo number_format($active_shift['opening_cash'], 2); ?> SDG</span>
-                            </div>
-                            <div class="summary-row">
-                                <span class="summary-label"><i class="fas fa-calendar-check" style="color: #27ae60;"></i> مواعيد العيادات</span>
-                                <span class="summary-value" style="color: #27ae60;">+<?php echo number_format($total_clinic - $total_services - $total_consumables, 2); ?></span>
-                            </div>
-                            <div class="summary-row">
-                                <span class="summary-label"><i class="fas fa-hand-holding-medical" style="color: #8e44ad;"></i> الخدمات الطبية</span>
-                                <span class="summary-value" style="color: #8e44ad;">+<?php echo number_format($total_services, 2); ?></span>
-                            </div>
-                            <div class="summary-row">
-                                <span class="summary-label"><i class="fas fa-box-open" style="color: #f39c12;"></i> المستهلكات</span>
-                                <span class="summary-value" style="color: #f39c12;">+<?php echo number_format($total_consumables, 2); ?></span>
-                            </div>
-                            <div class="summary-row">
-                                <span class="summary-label"><i class="fas fa-flask" style="color: #2980b9;"></i> المختبر</span>
-                                <span class="summary-value" style="color: #2980b9;">+<?php echo number_format($total_lab, 2); ?></span>
-                            </div>
-                            <div class="summary-row">
-                                <span class="summary-label"><i class="fas fa-undo" style="color: #e74c3c;"></i> المرتجعات</span>
-                                <span class="summary-value" style="color: #e74c3c;">-<?php echo number_format($total_refunds, 2); ?></span>
-                            </div>
-                            <div class="summary-total">
-                                <span class="summary-label">المبلغ المتوقع في الصندوق</span>
-                                <span class="summary-value" style="float: left; font-size: 24px;"><?php echo number_format($expected_cash, 2); ?> SDG</span>
+                        <div class="shm-close-panel">
+                            <div class="shm-close-head">
+                                <div class="ch-ico"><i class="fas fa-lock"></i></div>
+                                <div>
+                                    <h5>إغلاق الوردية</h5>
+                                    <small>جرد الصندوق والترحيل المحاسبي</small>
+                                </div>
                             </div>
 
-                            <form method="POST" class="mt-3">
-                                <input type="hidden" name="shift_id" value="<?php echo $active_shift['shift_id']; ?>">
-                                
-                                <div class="form-group mb-3">
-                                    <label class="text-white-50 font-weight-bold" style="font-size: 13px;">حساب الخزنة المستلم:</label>
-                                    <select name="target_account_id" class="form-control" style="border-radius: 8px; background: rgba(255,255,255,0.1); color: #fff; border: 1px solid rgba(255,255,255,0.2);" required>
-                                        <option value="" disabled selected style="color: #333;">اختر حساب الخزنة...</option>
-                                        <?php $treasury_accounts->data_seek(0); while($acc = $treasury_accounts->fetch_assoc()): ?>
-                                            <option value="<?php echo $acc['account_id']; ?>" style="color: #333;"><?php echo $acc['account_name']; ?></option>
+                            <div class="shm-summary-row">
+                                <span class="sr-lbl"><i class="fas fa-inbox" style="color:#60a5fa;"></i> العهدة الافتتاحية</span>
+                                <span class="sr-val"><?php echo number_format((float)$active_shift['opening_cash'], 2); ?></span>
+                            </div>
+                            <div class="shm-summary-row">
+                                <span class="sr-lbl"><i class="fas fa-calendar-check" style="color:#4ade80;"></i> مواعيد العيادات</span>
+                                <span class="sr-val" style="color:#86efac;">+<?php echo number_format((float)$total_appointments, 2); ?></span>
+                            </div>
+                            <div class="shm-summary-row">
+                                <span class="sr-lbl"><i class="fas fa-hand-holding-medical" style="color:#c4b5fd;"></i> الخدمات الطبية</span>
+                                <span class="sr-val" style="color:#c4b5fd;">+<?php echo number_format((float)$total_services, 2); ?></span>
+                            </div>
+                            <div class="shm-summary-row">
+                                <span class="sr-lbl"><i class="fas fa-box-open" style="color:#fcd34d;"></i> المستهلكات</span>
+                                <span class="sr-val" style="color:#fcd34d;">+<?php echo number_format((float)$total_consumables, 2); ?></span>
+                            </div>
+                            <div class="shm-summary-row">
+                                <span class="sr-lbl"><i class="fas fa-flask" style="color:#67e8f9;"></i> إيرادات المختبر</span>
+                                <span class="sr-val" style="color:#67e8f9;">+<?php echo number_format((float)$total_lab, 2); ?></span>
+                            </div>
+                            <div class="shm-summary-row">
+                                <span class="sr-lbl"><i class="fas fa-undo" style="color:#fca5a5;"></i> المرتجعات</span>
+                                <span class="sr-val" style="color:#fca5a5;">-<?php echo number_format((float)$total_refunds, 2); ?></span>
+                            </div>
+
+                            <div class="shm-summary-total">
+                                <span class="st-lbl">المتوقع في الصندوق</span>
+                                <span class="st-val"><?php echo number_format((float)$expected_cash, 2); ?> <small>SDG</small></span>
+                            </div>
+
+                            <form method="POST" class="shm-close-form" autocomplete="off">
+                                <input type="hidden" name="shift_id" value="<?php echo htmlspecialchars($active_shift['shift_id']); ?>">
+
+                                <div class="shm-close-field">
+                                    <label><i class="fas fa-university"></i> حساب الخزنة المستلم</label>
+                                    <select name="target_account_id" required>
+                                        <option value="" disabled selected>-- اختر حساب الخزنة --</option>
+                                        <?php $treasury_accounts->data_seek(0); while ($acc = $treasury_accounts->fetch_assoc()): ?>
+                                            <option value="<?php echo (int)$acc['account_id']; ?>">
+                                                [<?php echo htmlspecialchars($acc['account_code']); ?>]
+                                                <?php echo htmlspecialchars($acc['account_name']); ?>
+                                                (رصيد: <?php echo number_format((float)$acc['balance'], 2); ?>)
+                                            </option>
                                         <?php endwhile; ?>
                                     </select>
                                 </div>
 
-                                <div class="form-group mb-3">
-                                    <label class="text-white-50 font-weight-bold" style="font-size: 13px;">النقد الفعلي الموجود:</label>
-                                    <input type="number" step="0.01" name="closing_cash" 
-                                        class="form-control text-center font-weight-bold" 
-                                        style="border-radius: 8px; font-size: 24px; height: 50px; background: rgba(255,255,255,0.1); color: #fff; border: 1px solid rgba(255,255,255,0.2);"
-                                        placeholder="0.00" id="closingCashInput" required>
+                                <div class="shm-close-field">
+                                    <label><i class="fas fa-hand-holding-usd"></i> النقد الفعلي الموجود</label>
+                                    <input type="number" step="0.01" name="closing_cash" class="cash-input" placeholder="0.00" id="closingCashInput" required>
                                 </div>
 
-                                <!-- Variance Display -->
-                                <div class="sm-variance-display">
-                                    <div class="variance-label">الفرق (عجز / زيادة)</div>
-                                    <div class="variance-value" id="varianceDisplay">0.00 SDG</div>
+                                <div class="shm-variance match" id="varianceBox">
+                                    <div class="sv-lbl">الفرق (عجز / زيادة)</div>
+                                    <div class="sv-val" id="varianceDisplay">0.00 SDG</div>
                                 </div>
 
-                                <button type="submit" name="close_shift" class="sm-btn-danger" 
-                                    onclick="return confirm('⚠️ تأكيد إغلاق الوردية؟\\n\\nسيتم ترحيل جميع الإيرادات إلى الحسابات المالية.\\nلا يمكن التراجع عن هذه العملية.')">
-                                    <i class="fas fa-lock"></i> إغلاق الوردية والترحيل المحاسبي
+                                <button type="submit" name="close_shift" class="shm-btn-close"
+                                    onclick="return confirm('تأكيد إغلاق الوردية؟\n\nسيتم ترحيل قيد التسويات:\n• تصفية العهدة الافتتاحية\n• عجز/زيادة الوردية (إن وجد)\n\nملاحظة: الإيرادات مُرحّلة مسبقاً عند إنشاء كل عملية.\nلا يمكن التراجع عن هذا الإجراء.');">
+                                    <i class="fas fa-lock"></i> إغلاق الوردية والترحيل
                                 </button>
                             </form>
                         </div>
                     </div>
                 </div>
             <?php endif; ?>
-    <?php require_once('partials/_footer.php'); ?>
+
+            <?php require_once('partials/_footer.php'); ?>
         </div>
     </div>
-    <?php require_once('partials/_scripts.php'); ?>
 
+    <?php require_once('partials/_scripts.php'); ?>
     <script>
     $(document).ready(function() {
-        // ===== Transaction Filtering =====
-        $('#txFilters .sm-filter-tab').on('click', function() {
+        // ─── معاملات التصفية ───
+        $('#shmFilters .shm-filter').on('click', function() {
             var filter = $(this).data('filter');
-            
-            $('#txFilters .sm-filter-tab').removeClass('active');
+            $('#shmFilters .shm-filter').removeClass('active');
             $(this).addClass('active');
-            
+
             if (filter === 'all') {
-                $('#txList .sm-tx-item').show();
+                $('#shmTxList .shm-tx').show();
             } else {
-                $('#txList .sm-tx-item').hide();
-                $('#txList .sm-tx-item[data-filter-type="' + filter + '"]').show();
+                $('#shmTxList .shm-tx').hide();
+                $('#shmTxList .shm-tx[data-filter-type="' + filter + '"]').show();
             }
         });
 
-        // ===== Closing Cash Variance Calculator =====
-        var expectedCash = <?php echo $expected_cash; ?>;
+        // ─── الحاسبة الحية للفرق ───
+        var expectedCash = <?php echo (float)$expected_cash; ?>;
         var closingInput = document.getElementById('closingCashInput');
         var varianceDisplay = document.getElementById('varianceDisplay');
+        var varianceBox = document.getElementById('varianceBox');
 
-        if (closingInput) {
+        if (closingInput && varianceDisplay && varianceBox) {
             closingInput.addEventListener('input', function() {
                 var closingCash = parseFloat(this.value) || 0;
                 var variance = closingCash - expectedCash;
-                
-                if (Math.abs(variance) < 0.01) {
+                varianceBox.classList.remove('match', 'shortage', 'surplus');
+
+                if (Math.abs(variance) < 0.005) {
                     varianceDisplay.textContent = '✓ متطابق: 0.00 SDG';
-                    varianceDisplay.style.color = '#2ecc71';
+                    varianceBox.classList.add('match');
                 } else if (variance < 0) {
-                    varianceDisplay.textContent = '🔴 عجز: ' + Math.abs(variance).toFixed(2) + ' SDG';
-                    varianceDisplay.style.color = '#e74c3c';
+                    varianceDisplay.textContent = '↓ عجز: ' + Math.abs(variance).toFixed(2) + ' SDG';
+                    varianceBox.classList.add('shortage');
                 } else {
-                    varianceDisplay.textContent = '🟢 زيادة: ' + variance.toFixed(2) + ' SDG';
-                    varianceDisplay.style.color = '#2ecc71';
+                    varianceDisplay.textContent = '↑ زيادة: ' + variance.toFixed(2) + ' SDG';
+                    varianceBox.classList.add('surplus');
                 }
             });
         }

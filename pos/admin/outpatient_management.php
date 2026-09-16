@@ -414,145 +414,890 @@ if (isset($_POST['request_items'])) {
 
 $tab = isset($_GET['tab']) ? $_GET['tab'] : 'pricing';
 $service_items = $mysqli->query("SELECT * FROM rpos_medical_services ORDER BY created_at DESC");
+
+/* ============================================================
+   HERO STATS (read-only aggregates, same tables)
+   ============================================================ */
+$opd_services_count = 0; $opd_consumables_count = 0;
+$svc_cnt_q = $mysqli->query("SELECT 
+    SUM(CASE WHEN LOWER(TRIM(COALESCE(service_type,'Medical'))) IN ('medical','') THEN 1 ELSE 0 END) AS med,
+    SUM(CASE WHEN LOWER(TRIM(service_type))='consumable' THEN 1 ELSE 0 END) AS cons
+    FROM rpos_medical_services");
+if ($svc_cnt_q && $sc = $svc_cnt_q->fetch_assoc()) {
+    $opd_services_count = intval($sc['med']);
+    $opd_consumables_count = intval($sc['cons']);
+}
+
+$opd_today_visits = 0; $opd_today_revenue = 0.0;
+$today_str = date('Y-m-d');
+$opd_stat_q = $mysqli->query("SELECT COUNT(*) AS c FROM rpos_outpatient_records WHERE DATE(visit_date) = '$today_str'");
+if ($opd_stat_q && $o = $opd_stat_q->fetch_assoc()) $opd_today_visits = intval($o['c']);
+
+$rev_svc_q = $mysqli->query("SELECT IFNULL(SUM(amount_paid),0) AS r FROM rpos_patient_service_requests WHERE DATE(created_at) = '$today_str'");
+if ($rev_svc_q && $r = $rev_svc_q->fetch_assoc()) $opd_today_revenue += floatval($r['r']);
+$rev_cons_q = $mysqli->query("SELECT IFNULL(SUM(amount_paid),0) AS r FROM rpos_patient_consumable_requests WHERE DATE(created_at) = '$today_str'");
+if ($rev_cons_q && $r = $rev_cons_q->fetch_assoc()) $opd_today_revenue += floatval($r['r']);
+
 require_once('partials/_head.php');
 ?>
+<style>
+/* ============================================================
+   THEME TOKENS (fallback-safe with the app's existing theme)
+   ============================================================ */
+:root{
+    --opd-bg:            var(--bg-primary, #f4f6fc);
+    --opd-card:          var(--bg-card, #ffffff);
+    --opd-soft:          var(--bg-secondary, #f8fafc);
+    --opd-tertiary:      var(--bg-tertiary, #eef2f9);
+    --opd-border:        var(--border-color, rgba(15,23,42,.08));
+    --opd-border-light:  var(--border-light, rgba(15,23,42,.06));
+    --opd-text:          var(--text-primary, #1e293b);
+    --opd-text-2:        var(--text-secondary, #64748b);
+    --opd-muted:         var(--text-muted, #94a3b8);
+    --opd-accent:        var(--accent, #5e72e4);
+    --opd-accent-soft:   var(--accent-light, rgba(94,114,228,.12));
+    --opd-radius:        var(--radius-lg, 22px);
+    --opd-radius-sm:     var(--radius-md, 14px);
+    --opd-shadow:        var(--shadow-md, 0 8px 26px rgba(15,23,42,.07));
+    --opd-shadow-lg:     var(--shadow-lg, 0 22px 48px rgba(94,114,228,.20));
+    --opd-info:          #11cdef;
+    --opd-blue:          #1171ef;
+    --opd-success:       #2dce89;
+    --opd-teal:          #2dcecc;
+    --opd-warn:          #fb6340;
+    --opd-danger:        #f5365c;
+    --opd-grad-hero:     linear-gradient(120deg, #11cdef 0%, #1171ef 55%, #5e72e4 100%);
+    --opd-grad-primary:  linear-gradient(135deg, #5e72e4 0%, #825ee4 100%);
+    --opd-grad-info:     linear-gradient(135deg, #11cdef 0%, #1171ef 100%);
+    --opd-grad-success:  linear-gradient(135deg, #2dce89 0%, #2dcecc 100%);
+    --opd-grad-warm:     linear-gradient(135deg, #fb6340 0%, #f5365c 100%);
+    --opd-grad-dark:     linear-gradient(135deg, #172b4d 0%, #32325d 100%);
+}
+
+body{
+    background: var(--opd-bg);
+    color: var(--opd-text);
+    font-family: 'Tajawal', system-ui, -apple-system, sans-serif;
+    transition: background .25s ease, color .25s ease;
+}
+
+/* ============================================================
+   HERO
+   ============================================================ */
+.opd-hero{
+    position: relative;
+    overflow: hidden;
+    padding: 42px 0 118px;
+    background: var(--opd-grad-hero);
+    border-radius: 0 0 40px 40px;
+    isolation: isolate;
+}
+.opd-hero::after{
+    content:'';
+    position: absolute; inset:auto 0 -1px 0; height:70px;
+    background: linear-gradient(to top, var(--opd-bg), transparent);
+    opacity:.55; z-index:-1;
+}
+.opd-blob{
+    position:absolute; border-radius:50%; filter: blur(12px); opacity:.32; z-index:-1;
+    background: radial-gradient(circle at 30% 30%, #ffffff, transparent 62%);
+    animation: opdBlob 14s ease-in-out infinite;
+}
+.opd-blob.b1{ width:380px; height:380px; top:-160px; left:-110px; }
+.opd-blob.b2{ width:300px; height:300px; bottom:-140px; right:-80px; animation-delay:-5s; }
+.opd-blob.b3{ width:200px; height:200px; top:36%; right:22%; opacity:.16; animation-delay:-9s; }
+@keyframes opdBlob{
+    0%,100%{ transform: translate3d(0,0,0) scale(1); }
+    50%    { transform: translate3d(18px,-24px,0) scale(1.08); }
+}
+
+.opd-hero-inner{
+    display:flex; align-items:center; justify-content:space-between;
+    gap:28px; flex-wrap:wrap;
+} 
+.opd-hero-badge{
+    display:inline-flex; align-items:center; gap:8px;
+    background: rgba(255,255,255,.16);
+    border: 1px solid rgba(255,255,255,.28);
+    color:#fff; font-weight: 800; font-size:.8rem;
+    padding: 7px 16px; border-radius: 999px;
+    backdrop-filter: blur(8px);
+    margin-bottom:14px;
+}
+.opd-hero-text h1{
+    color:#fff; font-weight:800; font-size:1.85rem; line-height:1.35;
+    margin:0 0 10px; letter-spacing:-.4px;
+}
+.opd-hero-text p{
+    color: rgba(255,255,255,.85); margin:0; font-size:.95rem; line-height:1.9;
+}
+
+.opd-stats{
+    display:grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 14px;
+    margin-top: 22px;
+}
+.opd-stat{
+    background: rgba(255,255,255,.14);
+    border: 1px solid rgba(255,255,255,.25);
+    border-radius: 18px;
+    padding: 16px 18px;
+    backdrop-filter: blur(14px);
+    color:#fff;
+    transition: transform .3s ease, background .3s ease;
+    display:flex; align-items:center; gap:13px;
+}
+.opd-stat:hover{ transform: translateY(-4px); background: rgba(255,255,255,.22); }
+.opd-stat .opd-stat-ico{
+    width:42px; height:42px; border-radius:13px;
+    display:flex; align-items:center; justify-content:center;
+    background: rgba(255,255,255,.22); font-size:1rem;
+}
+.opd-stat .opd-stat-val{ font-size:1.35rem; font-weight:800; line-height:1.1; }
+.opd-stat .opd-stat-lbl{ font-size:.72rem; opacity:.88; font-weight:700; margin-top:3px; }
+
+/* ============================================================
+   WRAP
+   ============================================================ */
+.opd-wrap{
+    margin-top: -78px;
+    position: relative;
+    z-index: 5;
+    padding-bottom: 30px;
+}
+
+/* Alerts */
+.alert{
+    border-radius: var(--opd-radius-sm);
+    border: none;
+    box-shadow: var(--opd-shadow);
+    font-weight: 700;
+    padding: 15px 20px;
+}
+.alert-success{ background: rgba(45,206,137,.12); color:#0f9e6a; }
+.alert-danger{  background: rgba(245,54,92,.11);  color:#c81e45; }
+
+/* ============================================================
+   TABS (pill-style)
+   ============================================================ */
+.opd-tabs{
+    display:flex; gap:10px; flex-wrap:wrap;
+    background: var(--opd-card);
+    border: 1px solid var(--opd-border-light);
+    border-radius: 999px;
+    padding: 8px;
+    box-shadow: var(--opd-shadow);
+    margin-bottom: 22px;
+    width: fit-content;
+    max-width: 100%;
+}
+.opd-tab{
+    display:inline-flex; align-items:center; gap:9px;
+    background: transparent;
+    color: var(--opd-text-2);
+    border-radius: 999px;
+    padding: 11px 22px;
+    font-weight: 800; font-size:.84rem;
+    cursor:pointer; text-decoration:none;
+    transition: all .28s cubic-bezier(.4,0,.2,1);
+    white-space: nowrap;
+    border: none;
+}
+.opd-tab i{ font-size:.85rem; }
+.opd-tab:hover{ color: var(--opd-text); background: var(--opd-soft); text-decoration:none; }
+.opd-tab.active{
+    background: var(--opd-grad-primary);
+    color:#fff;
+    box-shadow: 0 10px 22px rgba(94,114,228,.28);
+}
+.opd-tab.active i{ color:#fff; }
+
+/* ============================================================
+   PANEL
+   ============================================================ */
+.opd-panel{
+    background: var(--opd-card);
+    border: 1px solid var(--opd-border-light);
+    border-radius: var(--opd-radius);
+    box-shadow: var(--opd-shadow);
+    overflow: hidden;
+}
+.opd-panel-head{
+    display:flex; align-items:center; justify-content:space-between;
+    gap:14px; flex-wrap:wrap;
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--opd-border-light);
+    background: var(--opd-card);
+}
+.opd-panel-title{
+    display:flex; align-items:center; gap:12px;
+    font-weight: 800; font-size:1.05rem; color: var(--opd-text);
+    margin: 0;
+}
+.opd-panel-title .pt-ico{
+    width:42px; height:42px; border-radius:13px;
+    display:flex; align-items:center; justify-content:center;
+    background: var(--opd-grad-primary); color:#fff; font-size:1rem;
+    box-shadow: 0 10px 20px rgba(94,114,228,.28);
+    flex: 0 0 auto;
+}
+.opd-panel-title.warm .pt-ico{ background: var(--opd-grad-info); box-shadow: 0 10px 20px rgba(17,205,239,.28); }
+.opd-panel-title.green .pt-ico{ background: var(--opd-grad-success); box-shadow: 0 10px 20px rgba(45,206,137,.28); }
+
+.opd-panel-actions{ display:flex; gap:10px; flex-wrap:wrap; }
+
+/* Buttons */
+.btn-opd{
+    display:inline-flex; align-items:center; justify-content:center; gap:8px;
+    border:none; cursor:pointer; text-decoration:none;
+    border-radius: 12px;
+    padding: 10px 20px;
+    font-weight: 800; font-size:.82rem;
+    transition: all .28s cubic-bezier(.4,0,.2,1);
+    white-space: nowrap;
+}
+.btn-opd:hover{ transform: translateY(-3px); text-decoration:none; }
+.btn-opd:active{ transform: translateY(-1px); }
+.btn-opd-primary{ background: var(--opd-grad-primary); color:#fff; box-shadow: 0 10px 22px rgba(94,114,228,.28); }
+.btn-opd-primary:hover{ box-shadow: 0 16px 30px rgba(94,114,228,.42); color:#fff; }
+.btn-opd-success{ background: var(--opd-grad-success); color:#fff; box-shadow: 0 10px 22px rgba(45,206,137,.28); }
+.btn-opd-success:hover{ box-shadow: 0 16px 30px rgba(45,206,137,.42); color:#fff; }
+.btn-opd-info{ background: var(--opd-grad-info); color:#fff; box-shadow: 0 10px 22px rgba(17,205,239,.28); }
+.btn-opd-info:hover{ box-shadow: 0 16px 30px rgba(17,205,239,.42); color:#fff; }
+.btn-opd-dark{ background: var(--opd-grad-dark); color:#fff; box-shadow: 0 10px 22px rgba(23,43,77,.28); }
+.btn-opd-dark:hover{ box-shadow: 0 16px 30px rgba(23,43,77,.42); color:#fff; }
+.btn-opd-ghost{ background: var(--opd-tertiary); color: var(--opd-text-2); }
+.btn-opd-ghost:hover{ background: var(--opd-border); color: var(--opd-text); }
+.btn-opd-sm{ padding: 8px 14px; font-size:.76rem; border-radius:10px; }
+
+/* ============================================================
+   TABLE
+   ============================================================ */
+.opd-table-wrap{ padding: 6px 12px 14px; }
+.opd-table{
+    width:100%; margin:0; color: var(--opd-text);
+    border-collapse: separate; border-spacing: 0;
+}
+.opd-table thead th{
+    background: var(--opd-soft);
+    color: var(--opd-text-2);
+    font-size:.72rem; font-weight: 800; text-transform: uppercase;
+    letter-spacing:.5px;
+    padding: 13px 14px; border:none;
+    border-bottom: 2px solid var(--opd-border);
+    white-space: nowrap;
+    text-align: right;
+}
+.opd-table tbody td{
+    padding: 14px 14px;
+    border-bottom: 1px solid var(--opd-border-light);
+    vertical-align: middle;
+    font-size:.86rem;
+    text-align: right;
+    color: var(--opd-text);
+}
+.opd-table tbody tr:last-child td{ border-bottom: none; }
+.opd-table tbody tr{ transition: background .25s ease; }
+.opd-table tbody tr:hover{ background: var(--opd-soft); }
+
+.opd-code{
+    font-family: 'Courier New', monospace;
+    font-weight: 800; font-size:.78rem;
+    color: var(--opd-accent);
+    background: var(--opd-accent-soft);
+    padding: 4px 10px; border-radius: 8px;
+    display: inline-block;
+}
+.opd-price{
+    font-weight: 800;
+    color: #0f9e6a;
+    font-size:.92rem;
+}
+.opd-price small{ color: var(--opd-muted); font-size:.7rem; font-weight:700; }
+
+/* Type pills */
+.type-pill{
+    display:inline-flex; align-items:center; gap:6px;
+    padding: 5px 12px; border-radius:999px;
+    font-size:.72rem; font-weight: 800;
+    border: 1px solid transparent;
+    white-space: nowrap;
+}
+.type-pill i{ font-size:.65rem; }
+.type-medical{    background: rgba(94,114,228,.12); color: var(--opd-accent); border-color: rgba(94,114,228,.22); }
+.type-consumable{ background: rgba(251,99,64,.12);  color:#c94324; border-color: rgba(251,99,64,.24); }
+
+/* Status pills */
+.status-pill{
+    display:inline-flex; align-items:center; gap:6px;
+    padding: 5px 12px; border-radius:999px;
+    font-size:.72rem; font-weight: 800;
+    border: 1px solid transparent;
+    white-space: nowrap;
+}
+.status-pill i{ font-size:.65rem; }
+.status-paid{      background: rgba(45,206,137,.13); color:#0f9e6a; border-color: rgba(45,206,137,.25); }
+.status-unpaid{    background: rgba(245,54,92,.11);  color:#c81e45; border-color: rgba(245,54,92,.22); }
+.status-partial{   background: rgba(251,99,64,.12);  color:#c94324; border-color: rgba(251,99,64,.24); }
+.status-je{        background: rgba(23,43,77,.90);   color:#fff; padding: 4px 10px; font-family: 'Courier New', monospace; font-size:.7rem; letter-spacing:.5px; }
+.status-noje{      background: var(--opd-tertiary); color: var(--opd-muted); }
+
+/* Vital signs mini displays */
+.vital-chip{
+    display:inline-flex; align-items:center; gap:6px;
+    font-weight: 800; font-size:.8rem;
+    padding: 4px 10px; border-radius: 8px;
+    background: var(--opd-soft);
+    border: 1px solid var(--opd-border-light);
+}
+.vital-bp{ color:#c81e45; background: rgba(245,54,92,.08); border-color: rgba(245,54,92,.18); }
+.vital-temp{ color:#d97706; background: rgba(251,99,64,.08); border-color: rgba(251,99,64,.18); }
+.vital-pulse{ color: var(--opd-accent); background: var(--opd-accent-soft); border-color: rgba(94,114,228,.22); }
+.vital-weight{ color:#0a91ab; background: rgba(17,205,239,.10); border-color: rgba(17,205,239,.22); }
+
+.date-chip{
+    display:inline-flex; align-items:center; gap:6px;
+    font-size:.75rem; font-weight: 700;
+    color: var(--opd-text-2);
+    background: var(--opd-soft);
+    padding: 4px 10px; border-radius: 8px;
+    border: 1px solid var(--opd-border-light);
+}
+
+/* ============================================================
+   MODALS
+   ============================================================ */
+.modal-content{
+    border-radius: var(--opd-radius);
+    border: 1px solid var(--opd-border-light);
+    background: var(--opd-card);
+    overflow: hidden;
+    box-shadow: 0 34px 76px rgba(15,23,42,.30);
+}
+.modal-header{
+    background: var(--opd-grad-primary) !important;
+    color:#fff;
+    border: none;
+    padding: 20px 24px;
+    align-items:center;
+}
+.modal-header.g-head{ background: var(--opd-grad-success) !important; }
+.modal-header.i-head{ background: var(--opd-grad-info) !important; }
+.modal-header.d-head{ background: var(--opd-grad-dark) !important; }
+.modal-header .modal-title{
+    color:#fff; font-weight: 800; font-size:1rem;
+    display:flex; align-items:center; gap:10px;
+}
+.modal-header .modal-title i{ opacity:.9; }
+.modal-header .close{
+    color:#fff; opacity:.85;
+    background: rgba(255,255,255,.16);
+    border-radius:50%;
+    width:34px; height:34px;
+    display:flex; align-items:center; justify-content:center;
+    text-shadow:none; padding:0; margin:0;
+    transition: all .25s ease;
+    outline:none;
+    font-size:1.2rem; line-height:1;
+}
+.modal-header .close:hover{ opacity:1; transform: rotate(90deg); background: rgba(255,255,255,.28); color:#fff; }
+.modal-body{ background: var(--opd-card); color: var(--opd-text); padding: 24px; }
+.modal-footer{
+    background: var(--opd-soft);
+    border-top: 1px solid var(--opd-border-light);
+    padding: 16px 24px;
+    gap: 10px;
+}
+.modal-backdrop.show{ opacity:.55; }
+.modal-backdrop{ background: #0f172a; }
+
+/* ============================================================
+   FORM CONTROLS
+   ============================================================ */
+.form-control, .form-control-alternative, .form-control:disabled, .form-control[readonly]{
+    border-radius: var(--opd-radius-sm);
+    border: 1px solid var(--opd-border);
+    background: var(--opd-soft);
+    color: var(--opd-text);
+    padding: .68rem 1rem;
+    font-size: .86rem; font-weight: 600;
+    height: auto;
+    transition: all .25s ease;
+}
+.form-control:focus, .form-control-alternative:focus{
+    border-color: var(--opd-accent);
+    background: var(--opd-card);
+    color: var(--opd-text);
+    box-shadow: 0 0 0 4px var(--opd-accent-soft);
+}
+.form-control::placeholder{ color: var(--opd-muted); font-weight: 500; }
+select.form-control{ cursor:pointer; }
+select[multiple].form-control{ min-height: 150px; padding: 8px; }
+select[multiple].form-control option{ padding: 8px 12px; border-radius: 8px; margin-bottom: 3px; }
+select[multiple].form-control option:checked{ background: linear-gradient(135deg, #5e72e4, #825ee4) !important; color:#fff !important; }
+textarea.form-control{ min-height: 76px; }
+
+.form-group label{
+    font-size:.78rem; font-weight: 800; color: var(--opd-text-2);
+    margin-bottom:7px; display:block;
+}
+.input-icon-wrap{ position: relative; }
+.input-icon-wrap i{
+    position: absolute; top:50%; right:15px; transform:translateY(-50%);
+    color: var(--opd-muted); font-size:.8rem; pointer-events:none; z-index:2;
+}
+.input-icon-wrap .form-control{ padding-right: 40px; }
+
+.form-block{
+    background: var(--opd-soft);
+    border: 1px solid var(--opd-border-light);
+    border-radius: var(--opd-radius-sm);
+    padding: 16px 18px;
+    margin-top: 16px;
+}
+.form-block-title{
+    font-size:.78rem; font-weight: 800; color: var(--opd-text-2);
+    display:flex; align-items:center; gap:8px;
+    margin-bottom: 14px; text-transform: uppercase; letter-spacing:.4px;
+}
+.form-block-title i{ color: var(--opd-accent); }
+
+/* Vital sign colored inputs */
+.vital-input input{
+    text-align: center; font-weight: 800; font-size:.9rem;
+}
+.vital-input.v-bp input{ color:#c81e45; background: rgba(245,54,92,.06); border-color: rgba(245,54,92,.22); }
+.vital-input.v-temp input{ color:#d97706; background: rgba(251,99,64,.06); border-color: rgba(251,99,64,.22); }
+.vital-input.v-pulse input{ color: var(--opd-accent); background: var(--opd-accent-soft); border-color: rgba(94,114,228,.22); }
+.vital-input.v-weight input{ color:#0a91ab; background: rgba(17,205,239,.08); border-color: rgba(17,205,239,.22); }
+.vital-input.v-bp input:focus, .vital-input.v-temp input:focus,
+.vital-input.v-pulse input:focus, .vital-input.v-weight input:focus{
+    background: var(--opd-card);
+    border-color: var(--opd-accent);
+    box-shadow: 0 0 0 4px var(--opd-accent-soft);
+}
+
+/* Amount inputs */
+.amount-fee input{
+    font-weight: 800 !important;
+    color: var(--opd-danger) !important;
+    background: rgba(245,54,92,.06) !important;
+    border-color: rgba(245,54,92,.22) !important;
+    font-size:.92rem !important;
+    text-align:center;
+}
+.amount-paid input{
+    font-weight: 800 !important;
+    color: #0f9e6a !important;
+    background: rgba(45,206,137,.07) !important;
+    border-color: rgba(45,206,137,.25) !important;
+    font-size:.92rem !important;
+}
+
+/* Total cost display card */
+.total-cost-card{
+    background: linear-gradient(120deg, rgba(45,206,137,.08), rgba(17,205,239,.08));
+    border: 1px solid rgba(45,206,137,.25);
+    border-radius: var(--opd-radius-sm);
+    padding: 16px 20px;
+    margin-top: 14px;
+}
+.total-cost-card .tc-row{
+    display:flex; align-items:center; justify-content:space-between;
+    gap:14px; flex-wrap:wrap;
+}
+.total-cost-card .tc-item{
+    flex: 1 1 120px; text-align:center;
+}
+.total-cost-card .tc-label{
+    font-size:.72rem; color: var(--opd-text-2); font-weight: 800;
+    text-transform: uppercase; letter-spacing:.4px;
+    margin-bottom:6px; display:block;
+}
+.total-cost-card .tc-value{
+    font-size:1rem; font-weight: 800;
+    color: var(--opd-text);
+}
+.total-cost-card .tc-op{
+    font-size:1.1rem; font-weight: 900;
+    color: var(--opd-muted);
+}
+.total-cost-card .tc-total{
+    font-size:1.35rem; font-weight: 900;
+    color:#0f9e6a;
+}
+.total-cost-card input{
+    width:100%; border:none; background: transparent;
+    text-align:center; font-weight: 800;
+    outline:none; color: inherit;
+    font-size: inherit;
+}
+.total-cost-card input[readonly]{ cursor: default; }
+
+/* ============================================================
+   Print button in requests tab
+   ============================================================ */
+.btn-print{
+    display:inline-flex; align-items:center; justify-content:center; gap:6px;
+    background: var(--opd-soft);
+    border: 1px solid rgba(45,206,137,.28);
+    color:#0f9e6a;
+    border-radius: 10px;
+    padding: 7px 13px;
+    font-size:.74rem; font-weight: 800;
+    text-decoration:none;
+    transition: all .28s cubic-bezier(.4,0,.2,1);
+    white-space: nowrap;
+}
+.btn-print:hover{
+    background: var(--opd-grad-success); color:#fff;
+    transform: translateY(-3px);
+    box-shadow: 0 10px 20px rgba(45,206,137,.32);
+    text-decoration:none;
+}
+
+/* ============================================================
+   Empty states
+   ============================================================ */
+.opd-empty{
+    text-align: center;
+    padding: 50px 20px;
+    color: var(--opd-muted);
+}
+.opd-empty .oe-ico{
+    width:72px; height:72px; margin:0 auto 14px;
+    border-radius:24px; display:flex; align-items:center; justify-content:center;
+    background: var(--opd-accent-soft); color: var(--opd-accent); font-size:1.6rem;
+    opacity:.85;
+}
+.opd-empty h4{ font-weight: 800; color: var(--opd-text); font-size:1rem; margin-bottom:6px; }
+.opd-empty p{ font-weight: 600; font-size:.84rem; margin:0; color: var(--opd-muted); }
+
+/* ============================================================
+   RESPONSIVE
+   ============================================================ */
+@media (max-width: 991px){
+    .opd-hero-text h1{ font-size:1.5rem; }
+    .opd-hero{ padding: 34px 0 100px; border-radius: 0 0 30px 30px; }
+    .opd-stats{ grid-template-columns: repeat(2, 1fr); }
+    .opd-panel-head{ padding: 18px 18px; }
+    .opd-table-wrap{ padding: 4px 6px 10px; }
+    .opd-table thead th, .opd-table tbody td{ padding: 11px 10px; }
+}
+@media (max-width: 575px){
+    .opd-hero-text h1{ font-size:1.25rem; }
+    .opd-hero-text p{ font-size:.85rem; }
+    .opd-stats{ grid-template-columns: 1fr 1fr; gap:10px; }
+    .opd-stat{ padding: 13px 14px; }
+    .opd-stat .opd-stat-val{ font-size:1.05rem; }
+    .opd-tabs{ width:100%; border-radius: var(--opd-radius); }
+    .opd-tab{ flex:1 1 auto; justify-content:center; padding: 10px 12px; font-size:.78rem; }
+    .opd-panel-head{ padding: 16px 14px; }
+    .opd-panel-actions{ width:100%; }
+    .opd-panel-actions .btn-opd{ flex:1 1 auto; justify-content:center; }
+    .opd-table thead{ display:none; }
+    .opd-table tbody tr{
+        display:block;
+        margin: 10px 4px;
+        border-radius: 14px;
+        border: 1px solid var(--opd-border-light);
+        padding: 6px;
+    }
+    .opd-table tbody td{
+        display:block; border-bottom: none; padding: 8px 12px;
+    }
+}
+</style>
 <body>
     <?php require_once('partials/_sidebar.php'); ?>
     <div class="main-content">
         <?php require_once('partials/_topnav.php'); ?>
-        <div style="background: linear-gradient(87deg, #11cdef 0, #1171ef 100%);" class="header pb-8 pt-5 pt-md-8">
-            <div class="container-fluid text-right">
-                <div class="header-body">
-                    <h1 class="text-white font-weight-bold"><i class="fas fa-stethoscope"></i> بوابـة العيادات الخارجية والخدمات الطبية</h1>
-                    <p class="text-white">إدارة الفحوصات، المستهلكات، وتسجيل الإيرادات المباشرة.</p>
+
+        <!-- ================= HERO ================= -->
+        <div class="opd-hero">
+            <span class="opd-blob b1"></span>
+            <span class="opd-blob b2"></span>
+            <span class="opd-blob b3"></span>
+            <div class="container-fluid text-right" dir="rtl" style="margin-top: 60px;">
+                <div class="opd-hero-inner">
+                    <div class="opd-hero-text">
+                        <span class="opd-hero-badge"><i class="fas fa-stethoscope"></i> العيادات الخارجية</span>
+                        <h1>بوابة العيادات الخارجية والخدمات الطبية</h1>
+                        <p><i class="fas fa-info-circle ml-1"></i> إدارة الفحوصات، التسعير، المستهلكات، وتسجيل الإيرادات المباشرة — من لوحة واحدة.</p>
+
+                        <div class="opd-stats">
+                            <div class="opd-stat">
+                                <div class="opd-stat-ico"><i class="fas fa-notes-medical"></i></div>
+                                <div>
+                                    <div class="opd-stat-val"><?php echo $opd_today_visits; ?></div>
+                                    <div class="opd-stat-lbl">فحوصات اليوم</div>
+                                </div>
+                            </div>
+                            <div class="opd-stat">
+                                <div class="opd-stat-ico"><i class="fas fa-tags"></i></div>
+                                <div>
+                                    <div class="opd-stat-val"><?php echo $opd_services_count; ?></div>
+                                    <div class="opd-stat-lbl">خدمات طبية مسعّرة</div>
+                                </div>
+                            </div>
+                            <div class="opd-stat">
+                                <div class="opd-stat-ico"><i class="fas fa-box-open"></i></div>
+                                <div>
+                                    <div class="opd-stat-val"><?php echo $opd_consumables_count; ?></div>
+                                    <div class="opd-stat-lbl">مستهلكات مسعّرة</div>
+                                </div>
+                            </div>
+                            <div class="opd-stat">
+                                <div class="opd-stat-ico"><i class="fas fa-coins"></i></div>
+                                <div>
+                                    <div class="opd-stat-val"><?php echo number_format($opd_today_revenue, 0); ?></div>
+                                    <div class="opd-stat-lbl">إيراد اليوم (SDG)</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
 
-        <div class="container-fluid mt--7 text-right" dir="rtl">
-            <div class="row mb-4">
-                <div class="col">
-                    <div class="nav-pills shadow p-2 bg-white rounded d-flex justify-content-start">
-                        <a class="nav-link ml-2 <?php echo $tab=='pricing'?'active bg-success text-white':'text-dark';?>" href="outpatient_management.php?tab=pricing"><i class="fas fa-tags"></i> تسعير الخدمات والمستهلكات</a>
-                        <a class="nav-link ml-2 <?php echo $tab=='records'?'active bg-success text-white':'text-dark';?>" href="outpatient_management.php?tab=records"><i class="fas fa-notes-medical"></i> سجل الفحوصات الطبية</a>
-                        <a class="nav-link <?php echo $tab=='requests'?'active bg-success text-white':'text-dark';?>" href="outpatient_management.php?tab=requests"><i class="fas fa-receipt"></i> تتبع الطلبات والإيصالات</a>
+        <!-- ================= CONTENT ================= -->
+        <div class="opd-wrap container-fluid" dir="rtl">
+
+            <?php if(isset($success)): ?>
+            <div class="alert alert-success">
+                <i class="fas fa-check-circle ml-1"></i> <?php echo $success; ?>
+            </div>
+            <?php endif; ?>
+            <?php if(isset($err)): ?>
+            <div class="alert alert-danger">
+                <i class="fas fa-exclamation-triangle ml-1"></i> <?php echo $err; ?>
+            </div>
+            <?php endif; ?>
+
+            <!-- Tabs -->
+            <div class="opd-tabs">
+                <a class="opd-tab <?php echo $tab=='pricing'?'active':'';?>" href="outpatient_management.php?tab=pricing">
+                    <i class="fas fa-tags"></i> تسعير الخدمات والمستهلكات
+                </a>
+                <a class="opd-tab <?php echo $tab=='records'?'active':'';?>" href="outpatient_management.php?tab=records">
+                    <i class="fas fa-notes-medical"></i> سجل الفحوصات الطبية
+                </a>
+                <a class="opd-tab <?php echo $tab=='requests'?'active':'';?>" href="outpatient_management.php?tab=requests">
+                    <i class="fas fa-receipt"></i> تتبع الطلبات والإيصالات
+                </a>
+            </div>
+
+            <!-- ==================== PRICING TAB ==================== -->
+            <?php if($tab == 'pricing'): ?>
+            <div class="opd-panel">
+                <div class="opd-panel-head">
+                    <h3 class="opd-panel-title">
+                        <span class="pt-ico"><i class="fas fa-tags"></i></span>
+                        تسعير الخدمات الطبية والمستهلكات
+                    </h3>
+                    <div class="opd-panel-actions">
+                        <button class="btn-opd btn-opd-dark" data-toggle="modal" data-target="#pricingModal">
+                            <i class="fas fa-plus"></i> إضافة خدمة أو مستهلك
+                        </button>
+                    </div>
+                </div>
+                <div class="opd-table-wrap">
+                    <div class="table-responsive">
+                        <table class="opd-table datatable">
+                            <thead>
+                                <tr>
+                                    <th>كود الخدمة</th>
+                                    <th>البيان</th>
+                                    <th>النوع</th>
+                                    <th>السعر</th>
+                                    <th>بدل التمريض (%)</th>
+                                    <th>الوصف</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php
+                                $any_service = false;
+                                while($service = $service_items->fetch_assoc()) {
+                                    $any_service = true;
+                                    $is_consumable = strtolower(trim((string)$service['service_type'])) === 'consumable';
+                                ?>
+                                <tr>
+                                    <td><span class="opd-code"><?php echo htmlspecialchars($service['service_code']); ?></span></td>
+                                    <td style="font-weight:800;"><?php echo htmlspecialchars($service['service_name']); ?></td>
+                                    <td>
+                                        <?php if($is_consumable): ?>
+                                            <span class="type-pill type-consumable"><i class="fas fa-box-open"></i> مستهلك طبي</span>
+                                        <?php else: ?>
+                                            <span class="type-pill type-medical"><i class="fas fa-stethoscope"></i> خدمة طبية</span>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td><span class="opd-price"><?php echo number_format($service['fee'], 2); ?> <small>SDG</small></span></td>
+                                    <td>
+                                        <span class="status-pill" style="background: var(--opd-accent-soft); color: var(--opd-accent);">
+                                            <i class="fas fa-percentage"></i> <?php echo number_format($service['nurse_commission_pct'], 2); ?>%
+                                        </span>
+                                    </td>
+                                    <td style="color: var(--opd-text-2); font-size:.82rem;"><?php echo htmlspecialchars($service['description']); ?></td>
+                                </tr>
+                                <?php }
+                                if (!$any_service): ?>
+                                <tr>
+                                    <td colspan="6">
+                                        <div class="opd-empty">
+                                            <div class="oe-ico"><i class="fas fa-tags"></i></div>
+                                            <h4>لا توجد خدمات مسعّرة بعد</h4>
+                                            <p>ابدأ بإضافة أول خدمة طبية أو مستهلك من زر «إضافة خدمة أو مستهلك».</p>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <?php endif; ?>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             </div>
 
-            <?php if(isset($success)) echo "<div class='alert alert-success shadow-sm border-0'><i class='fas fa-check-circle'></i> $success </div>"; ?>
-            <?php if(isset($err)) echo "<div class='alert alert-danger shadow-sm border-0'><i class='fas fa-exclamation-triangle'></i> $err</div>"; ?>
-
-            <?php if($tab == 'pricing'): ?>
-            <div class="card shadow">
-                <div class="card-header border-0 d-flex justify-content-between align-items-center">
-                    <h3 class="mb-0 font-weight-bold">تسعير الخدمات الطبية والمستهلكات</h3>
-                    <button class="btn btn-dark" data-toggle="modal" data-target="#pricingModal"><i class="fas fa-plus"></i> إضافة خدمة أو مستهلك</button>
-                </div>
-                <div class="table-responsive p-3">
-                    <table class="table align-items-center table-flush datatable">
-                        <thead class="thead-light">
-                            <tr>
-                                <th>كود الخدمة</th>
-                                <th>البيان</th>
-                                <th>النوع</th>
-                                <th>السعر</th>
-                                <th>بدل التمريض (%)</th>
-                                <th>الوصف</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php while($service = $service_items->fetch_assoc()) { ?>
-                            <tr>
-                                <td class="font-weight-bold text-monospace"><?php echo $service['service_code']; ?></td>
-                                <td><?php echo $service['service_name']; ?></td>
-                                <td>
-                                    <?php if(strtolower(trim((string)$service['service_type'])) == 'consumable'): ?>
-                                        <span class="badge badge-warning">مستهلك طبي</span>
-                                    <?php else: ?>
-                                        <span class="badge badge-info">خدمة طبية</span>
-                                    <?php endif; ?>
-                                </td>
-                                <td class="text-success font-weight-bold"><?php echo number_format($service['fee'], 2); ?> SDG</td>
-                                <td><?php echo number_format($service['nurse_commission_pct'], 2); ?>%</td>
-                                <td class="text-wrap"><?php echo $service['description']; ?></td>
-                            </tr>
-                            <?php } ?>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
+            <!-- Pricing Modal -->
             <div class="modal fade" id="pricingModal" tabindex="-1">
-                <div class="modal-dialog modal-lg">
+                <div class="modal-dialog modal-lg modal-dialog-centered">
                     <div class="modal-content text-right" dir="rtl">
-                        <div class="modal-header bg-success text-white"><h5 class="modal-title text-white">إضافة بند تسعير جديد</h5></div>
+                        <div class="modal-header g-head">
+                            <h5 class="modal-title"><i class="fas fa-plus-circle"></i> إضافة بند تسعير جديد</h5>
+                            <button type="button" class="close" data-dismiss="modal">&times;</button>
+                        </div>
                         <form method="POST">
-                            <div class="modal-body bg-light">
-                                <div class="row">
-                                    <div class="col-md-6"><div class="form-group"><label>اسم الخدمة / المستهلك <span class="text-danger">*</span></label><input type="text" name="service_name" class="form-control" required></div></div>
-                                    <div class="col-md-6"><div class="form-group"><label>نوع البند <span class="text-danger">*</span></label><select name="service_type" class="form-control" required><option value="Medical">خدمة طبية (لا يخصم من المخزون)</option><option value="Consumable">مستهلك طبي (لا يخصم من المخزون)</option></select></div></div>
+                            <div class="modal-body">
+                                <div class="form-row">
+                                    <div class="form-group col-md-6">
+                                        <label>اسم الخدمة / المستهلك <span class="text-danger">*</span></label>
+                                        <div class="input-icon-wrap">
+                                            <i class="fas fa-tag"></i>
+                                            <input type="text" name="service_name" class="form-control" placeholder="مثال: تخطيط قلب" required>
+                                        </div>
+                                    </div>
+                                    <div class="form-group col-md-6">
+                                        <label>نوع البند <span class="text-danger">*</span></label>
+                                        <select name="service_type" class="form-control" required>
+                                            <option value="Medical">خدمة طبية (لا يخصم من المخزون)</option>
+                                            <option value="Consumable">مستهلك طبي (لا يخصم من المخزون)</option>
+                                        </select>
+                                    </div>
                                 </div>
-                                <div class="row">
-                                    <div class="col-md-6"><div class="form-group"><label>السعر المعتمد (رسوم الخدمة) <span class="text-danger">*</span></label><input type="number" step="0.01" name="service_fee" class="form-control text-success font-weight-bold" required></div></div>
-                                    <div class="col-md-6"><div class="form-group"><label>نسبة استحقاق كادر التمريض (%)</label><input type="number" step="0.01" name="nurse_commission_pct" class="form-control" value="0.00"></div></div>
+                                <div class="form-row">
+                                    <div class="form-group col-md-6 mb-0">
+                                        <label>السعر المعتمد (رسوم الخدمة) <span class="text-danger">*</span></label>
+                                        <div class="input-icon-wrap amount-fee">
+                                            <i class="fas fa-coins"></i>
+                                            <input type="number" step="0.01" name="service_fee" class="form-control" placeholder="0.00" required>
+                                        </div>
+                                    </div>
+                                    <div class="form-group col-md-6 mb-0">
+                                        <label>نسبة استحقاق كادر التمريض (%)</label>
+                                        <div class="input-icon-wrap">
+                                            <i class="fas fa-percentage"></i>
+                                            <input type="number" step="0.01" name="nurse_commission_pct" class="form-control" value="0.00">
+                                        </div>
+                                    </div>
                                 </div>
-                                <div class="form-group"><label>ملاحظات إضافية</label><textarea name="service_description" class="form-control" rows="2"></textarea></div>
+                                <div class="form-block">
+                                    <div class="form-block-title"><i class="fas fa-align-right"></i> ملاحظات إضافية</div>
+                                    <textarea name="service_description" class="form-control" rows="3" placeholder="وصف مختصر للخدمة أو المستهلك..."></textarea>
+                                </div>
                             </div>
-                            <div class="modal-footer"><button type="button" class="btn btn-secondary" data-dismiss="modal">إغلاق</button><button type="submit" name="add_service_pricing" class="btn btn-success"><i class="fas fa-save"></i> حفظ البند</button></div>
+                            <div class="modal-footer">
+                                <button type="button" class="btn-opd btn-opd-ghost" data-dismiss="modal">
+                                    <i class="fas fa-times"></i> إغلاق
+                                </button>
+                                <button type="submit" name="add_service_pricing" class="btn-opd btn-opd-success">
+                                    <i class="fas fa-save"></i> حفظ البند
+                                </button>
+                            </div>
                         </form>
                     </div>
                 </div>
             </div>
 
+            <!-- ==================== RECORDS TAB ==================== -->
             <?php elseif($tab == 'records'): ?>
-            <div class="card shadow">
-                <div class="card-header border-0 d-flex justify-content-between align-items-center">
-                    <h3 class="mb-0 font-weight-bold">المرضى والعلامات الحيوية (Triage)</h3>
-                    <div>
-                        <button class="btn btn-outline-primary" data-toggle="modal" data-target="#opdModal"><i class="fas fa-heartbeat"></i> تسجيل علامات حيوية</button>
-                        <button class="btn btn-primary" data-toggle="modal" data-target="#reqModal"><i class="fas fa-file-invoice-dollar"></i> إصدار فاتورة خدمة طبية</button>
+            <div class="opd-panel">
+                <div class="opd-panel-head">
+                    <h3 class="opd-panel-title warm">
+                        <span class="pt-ico"><i class="fas fa-notes-medical"></i></span>
+                        المرضى والعلامات الحيوية (Triage)
+                    </h3>
+                    <div class="opd-panel-actions">
+                        <button class="btn-opd btn-opd-info" data-toggle="modal" data-target="#opdModal">
+                            <i class="fas fa-heartbeat"></i> تسجيل علامات حيوية
+                        </button>
+                        <button class="btn-opd btn-opd-primary" data-toggle="modal" data-target="#reqModal">
+                            <i class="fas fa-file-invoice-dollar"></i> إصدار فاتورة خدمة طبية
+                        </button>
                     </div>
                 </div>
-                <div class="table-responsive p-3">
-                    <table class="table align-items-center table-flush datatable">
-                        <thead class="thead-light">
-                            <tr>
-                                <th>التاريخ</th>
-                                <th>المريض</th>
-                                <th>الضغط</th>
-                                <th>الحرارة</th>
-                                <th>النبض</th>
-                                <th>الوزن</th>
-                                <th>التشخيص / الملاحظات</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php
-                            $records = $mysqli->query("SELECT r.*, p.name FROM rpos_outpatient_records r JOIN rpos_patients p ON r.patient_id = p.patient_id ORDER BY r.visit_date DESC");
-                            while($row = $records->fetch_assoc()){
-                            ?>
-                            <tr>
-                                <td><span class="badge badge-light"><?php echo date('Y-m-d H:i', strtotime($row['visit_date'])); ?></span></td>
-                                <td><strong><?php echo $row['name']; ?></strong><br><small class="text-muted"><?php echo $row['outpatient_code']; ?></small></td>
-                                <td class="text-danger font-weight-bold"><?php echo $row['blood_pressure']; ?></td>
-                                <td><?php echo $row['temperature']; ?> °C</td>
-                                <td><?php echo $row['pulse_rate']; ?> bpm</td>
-                                <td><?php echo $row['weight']; ?> kg</td>
-                                <td class="text-wrap"><?php echo $row['diagnosis']; ?></td>
-                            </tr>
-                            <?php } ?>
-                        </tbody>
-                    </table>
+                <div class="opd-table-wrap">
+                    <div class="table-responsive">
+                        <table class="opd-table datatable">
+                            <thead>
+                                <tr>
+                                    <th>التاريخ</th>
+                                    <th>المريض</th>
+                                    <th>الضغط</th>
+                                    <th>الحرارة</th>
+                                    <th>النبض</th>
+                                    <th>الوزن</th>
+                                    <th>التشخيص / الملاحظات</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php
+                                $records = $mysqli->query("SELECT r.*, p.name FROM rpos_outpatient_records r JOIN rpos_patients p ON r.patient_id = p.patient_id ORDER BY r.visit_date DESC");
+                                $any_record = false;
+                                while($row = $records->fetch_assoc()){
+                                    $any_record = true;
+                                ?>
+                                <tr>
+                                    <td><span class="date-chip"><i class="fas fa-calendar-alt"></i> <?php echo date('Y-m-d H:i', strtotime($row['visit_date'])); ?></span></td>
+                                    <td>
+                                        <div style="font-weight:800; color: var(--opd-text);"><?php echo htmlspecialchars($row['name']); ?></div>
+                                        <span class="opd-code" style="margin-top:4px; display:inline-block;"><?php echo htmlspecialchars($row['outpatient_code']); ?></span>
+                                    </td>
+                                    <td><span class="vital-chip vital-bp"><i class="fas fa-heartbeat"></i> <?php echo htmlspecialchars($row['blood_pressure']); ?></span></td>
+                                    <td><span class="vital-chip vital-temp"><i class="fas fa-thermometer-half"></i> <?php echo htmlspecialchars($row['temperature']); ?> °C</span></td>
+                                    <td><span class="vital-chip vital-pulse"><i class="fas fa-wave-square"></i> <?php echo htmlspecialchars($row['pulse_rate']); ?> bpm</span></td>
+                                    <td><span class="vital-chip vital-weight"><i class="fas fa-weight"></i> <?php echo htmlspecialchars($row['weight']); ?> kg</span></td>
+                                    <td style="color: var(--opd-text-2); font-size:.84rem; max-width:320px;">
+                                        <?php echo htmlspecialchars($row['diagnosis']); ?>
+                                    </td>
+                                </tr>
+                                <?php }
+                                if (!$any_record): ?>
+                                <tr>
+                                    <td colspan="7">
+                                        <div class="opd-empty">
+                                            <div class="oe-ico"><i class="fas fa-notes-medical"></i></div>
+                                            <h4>لا توجد فحوصات مسجلة بعد</h4>
+                                            <p>ابدأ بتسجيل أول فحص علامات حيوية من زر «تسجيل علامات حيوية».</p>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <?php endif; ?>
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
 
+            <!-- OPD Vitals Modal -->
             <div class="modal fade" id="opdModal" tabindex="-1">
-                <div class="modal-dialog modal-lg">
+                <div class="modal-dialog modal-lg modal-dialog-centered">
                     <div class="modal-content text-right" dir="rtl">
-                        <div class="modal-header bg-primary text-white"><h5 class="modal-title text-white">تسجيل فحص العلامات الحيوية</h5></div>
+                        <div class="modal-header">
+                            <h5 class="modal-title"><i class="fas fa-heartbeat"></i> تسجيل فحص العلامات الحيوية</h5>
+                            <button type="button" class="close" data-dismiss="modal">&times;</button>
+                        </div>
                         <form method="POST">
-                            <div class="modal-body bg-light">
+                            <div class="modal-body">
                                 <div class="form-group">
                                     <label>اختر المريض <span class="text-danger">*</span></label>
                                     <select name="patient_id" class="form-control patient-search-select" required style="width:100%;">
@@ -561,72 +1306,105 @@ require_once('partials/_head.php');
                                     $pts = $mysqli->query("SELECT * FROM rpos_patients ORDER BY name ASC");
                                     while($p = $pts->fetch_assoc()) {
                                         $sel = ($p['patient_id'] == $selected_patient_id) ? 'selected' : '';
-                                        echo "<option value='{$p['patient_id']}'>{$p['name']} - رقم طبي: {$p['patient_number']} - هاتف: {$p['phone']}</option>";
+                                        echo "<option value='{$p['patient_id']}' $sel>".htmlspecialchars($p['name'])." - رقم طبي: ".htmlspecialchars($p['patient_number'])." - هاتف: ".htmlspecialchars($p['phone'])."</option>";
                                     }
                                     ?>
                                     </select>
-                                    
                                 </div>
-                                <div class="row">
-                                    <div class="col-md-3"><div class="form-group"><label>ضغط الدم (mmHg)</label><input type="text" name="blood_pressure" placeholder="120/80" class="form-control text-center text-danger font-weight-bold"></div></div>
-                                    <div class="col-md-3"><div class="form-group"><label>الحرارة (°C)</label><input type="number" step="0.1" name="temperature" placeholder="37.0" class="form-control text-center text-warning font-weight-bold"></div></div>
-                                    <div class="col-md-3"><div class="form-group"><label>النبض (bpm)</label><input type="number" name="pulse_rate" placeholder="72" class="form-control text-center text-primary font-weight-bold"></div></div>
-                                    <div class="col-md-3"><div class="form-group"><label>الوزن (kg)</label><input type="number" step="0.1" name="weight" placeholder="70" class="form-control text-center text-info font-weight-bold"></div></div>
+
+                                <div class="form-block">
+                                    <div class="form-block-title"><i class="fas fa-chart-line"></i> العلامات الحيوية</div>
+                                    <div class="form-row">
+                                        <div class="form-group col-md-3 mb-0 vital-input v-bp">
+                                            <label>ضغط الدم (mmHg)</label>
+                                            <input type="text" name="blood_pressure" placeholder="120/80" class="form-control">
+                                        </div>
+                                        <div class="form-group col-md-3 mb-0 vital-input v-temp">
+                                            <label>الحرارة (°C)</label>
+                                            <input type="number" step="0.1" name="temperature" placeholder="37.0" class="form-control">
+                                        </div>
+                                        <div class="form-group col-md-3 mb-0 vital-input v-pulse">
+                                            <label>النبض (bpm)</label>
+                                            <input type="number" name="pulse_rate" placeholder="72" class="form-control">
+                                        </div>
+                                        <div class="form-group col-md-3 mb-0 vital-input v-weight">
+                                            <label>الوزن (kg)</label>
+                                            <input type="number" step="0.1" name="weight" placeholder="70" class="form-control">
+                                        </div>
+                                    </div>
                                 </div>
-                                <div class="form-group"><label>الشكوى الرئيسية (Chief Complaint)</label><textarea name="symptoms" class="form-control" rows="2"></textarea></div>
-                                <div class="form-group"><label>الملاحظات الإكلينيكية <span class="text-danger">*</span></label><textarea name="diagnosis" class="form-control" rows="2" required></textarea></div>
+
+                                <div class="form-group mt-3">
+                                    <label>الشكوى الرئيسية (Chief Complaint)</label>
+                                    <textarea name="symptoms" class="form-control" rows="2" placeholder="مثال: صداع مستمر منذ 3 أيام..."></textarea>
+                                </div>
+                                <div class="form-group mb-0">
+                                    <label>الملاحظات الإكلينيكية <span class="text-danger">*</span></label>
+                                    <textarea name="diagnosis" class="form-control" rows="2" required placeholder="التشخيص المبدئي..."></textarea>
+                                </div>
                             </div>
-                            <div class="modal-footer"><button type="button" class="btn btn-secondary" data-dismiss="modal">إغلاق</button><button type="submit" name="add_outpatient" class="btn btn-primary"><i class="fas fa-save"></i> حفظ السجل</button></div>
+                            <div class="modal-footer">
+                                <button type="button" class="btn-opd btn-opd-ghost" data-dismiss="modal">
+                                    <i class="fas fa-times"></i> إغلاق
+                                </button>
+                                <button type="submit" name="add_outpatient" class="btn-opd btn-opd-primary">
+                                    <i class="fas fa-save"></i> حفظ السجل
+                                </button>
+                            </div>
                         </form>
                     </div>
                 </div>
             </div>
 
+            <!-- Request Modal -->
             <div class="modal fade" id="reqModal" tabindex="-1">
-                <div class="modal-dialog modal-lg">
+                <div class="modal-dialog modal-lg modal-dialog-centered">
                     <div class="modal-content text-right" dir="rtl">
-                        <div class="modal-header bg-success text-white"><h5 class="modal-title text-white"><i class="fas fa-file-invoice-dollar"></i> إصدار فاتورة خدمة طبية / مستهلكات</h5></div>
+                        <div class="modal-header g-head">
+                            <h5 class="modal-title"><i class="fas fa-file-invoice-dollar"></i> إصدار فاتورة خدمة طبية / مستهلكات</h5>
+                            <button type="button" class="close" data-dismiss="modal">&times;</button>
+                        </div>
                         <form method="POST">
-                            <div class="modal-body bg-light">
-                                <div class="row">
-                                    <div class="col-md-6">
-                                        <div class="form-group">
-                                            <label class="font-weight-bold">اسم المريض <span class="text-danger">*</span></label>
-                                            <select name="patient_id" class="form-control patient-search-select" required style="width:100%;">
-                                                <option value="">-- ابحث عن المريض بالاسم أو الرقم الطبي أو الهاتف --</option>
-                                                <?php $pts = $mysqli->query("SELECT * FROM rpos_patients"); while($p=$pts->fetch_assoc()) echo "<option value='{$p['patient_id']}'>{$p['name']} - رقم طبي: {$p['patient_number']} - هاتف: {$p['phone']}</option>"; ?>
-                                            </select>
-                                        </div>
+                            <div class="modal-body">
+
+                                <div class="form-row">
+                                    <div class="form-group col-md-6">
+                                        <label>اسم المريض <span class="text-danger">*</span></label>
+                                        <select name="patient_id" class="form-control patient-search-select" required style="width:100%;">
+                                            <option value="">-- ابحث عن المريض بالاسم أو الرقم الطبي أو الهاتف --</option>
+                                            <?php $pts = $mysqli->query("SELECT * FROM rpos_patients"); while($p=$pts->fetch_assoc()) echo "<option value='{$p['patient_id']}'>".htmlspecialchars($p['name'])." - رقم طبي: ".htmlspecialchars($p['patient_number'])." - هاتف: ".htmlspecialchars($p['phone'])."</option>"; ?>
+                                        </select>
                                     </div>
-                                    <div class="col-md-6">
-                                        <div class="form-group">
-                                            <label class="font-weight-bold">نوع الخدمة / الفاتورة <span class="text-danger">*</span></label>
-                                            <select name="request_type" id="request_type" class="form-control" required>
-                                                <option value="service" selected>إجراء خدمة طبية (كشف، تخطيط، غيار...)</option>
-                                                <option value="consumable">صرف مستهلك طبي (أدوية مستعجلة، حقن...)</option>
-                                            </select>
-                                        </div>
+                                    <div class="form-group col-md-6">
+                                        <label>نوع الخدمة / الفاتورة <span class="text-danger">*</span></label>
+                                        <select name="request_type" id="request_type" class="form-control" required>
+                                            <option value="service" selected>إجراء خدمة طبية (كشف، تخطيط، غيار...)</option>
+                                            <option value="consumable">صرف مستهلك طبي (أدوية مستعجلة، حقن...)</option>
+                                        </select>
                                     </div>
                                 </div>
 
                                 <div class="form-group service-field">
-                                     <label class="font-weight-bold text-primary">اختر الخدمات الطبية المطلوبة <span class="text-danger">*</span></label>
-                                     <select name="service_ids[]" id="service_select" class="form-control dynamic-price-trigger" multiple size="6">
+                                    <label style="color: var(--opd-accent);">اختر الخدمات الطبية المطلوبة <span class="text-danger">*</span></label>
+                                    <select name="service_ids[]" id="service_select" class="form-control dynamic-price-trigger" multiple size="6">
                                         <?php 
                                         $services = $mysqli->query("SELECT service_id, service_name, fee FROM rpos_medical_services WHERE LOWER(TRIM(COALESCE(service_type,'Medical'))) IN ('medical','') ORDER BY service_name ASC"); 
                                         if ($services && $services->num_rows > 0) {
                                             while($s=$services->fetch_assoc()){
-                                                echo "<option value='{$s['service_id']}' data-price='{$s['fee']}'>{$s['service_name']} - السعر: " . number_format($s['fee'],2) . " SDG</option>";
+                                                echo "<option value='{$s['service_id']}' data-price='{$s['fee']}'>".htmlspecialchars($s['service_name'])." - السعر: " . number_format($s['fee'],2) . " SDG</option>";
                                             }
                                         } else {
                                             echo "<option value='' disabled>لا توجد خدمات طبية مسعرة حالياً</option>";
                                         }
                                         ?>
-                                     </select>
-                                     <small class="form-text text-muted"><i class="fas fa-info-circle"></i> يمكنك تحديد أكثر من خدمة بالضغط على الخدمات المطلوبة.</small>
-                                 </div>
+                                    </select>
+                                    <small class="form-text" style="color: var(--opd-muted); font-weight:600; margin-top:8px;">
+                                        <i class="fas fa-info-circle"></i> يمكنك تحديد أكثر من خدمة بالضغط على الخدمات المطلوبة.
+                                    </small>
+                                </div>
+
                                 <div class="form-group consumable-field d-none">
-                                    <label class="font-weight-bold text-warning">اختر المستهلك الطبي المطلوب <span class="text-danger">*</span></label>
+                                    <label style="color:#c94324;">اختر المستهلك الطبي المطلوب <span class="text-danger">*</span></label>
                                     <select name="item_id" id="consumable_select" class="form-control dynamic-price-trigger">
                                         <option value="" data-price="0">-- اختر المستهلك --</option>
                                         <optgroup label="مستهلكات مسعرة خارج المستودع">
@@ -634,7 +1412,7 @@ require_once('partials/_head.php');
                                         $priced_consumables = $mysqli->query("SELECT service_id, service_name, fee FROM rpos_medical_services WHERE service_type = 'Consumable' ORDER BY service_name ASC");
                                         if ($priced_consumables && $priced_consumables->num_rows > 0) {
                                             while($c=$priced_consumables->fetch_assoc()) {
-                                                echo "<option value='SVC-{$c['service_id']}' data-price='{$c['fee']}'>{$c['service_name']} - السعر: " . number_format($c['fee'],2) . " SDG</option>";
+                                                echo "<option value='SVC-{$c['service_id']}' data-price='{$c['fee']}'>".htmlspecialchars($c['service_name'])." - السعر: " . number_format($c['fee'],2) . " SDG</option>";
                                             }
                                         } else {
                                             echo "<option value='' disabled>لا توجد مستهلكات مسعرة خارج المستودع</option>";
@@ -645,124 +1423,191 @@ require_once('partials/_head.php');
                                         <?php
                                         $items = $mysqli->query("SELECT * FROM rpos_store_items WHERE current_stock > 0 ORDER BY item_name ASC");
                                         while($i=$items->fetch_assoc()) {
-                                            echo "<option value='STR-{$i['item_id']}' data-price='{$i['selling_price']}'>{$i['item_name']} (متاح: {$i['current_stock']}) - السعر: " . number_format($i['selling_price'],2) . " SDG</option>";
+                                            echo "<option value='STR-{$i['item_id']}' data-price='{$i['selling_price']}'>".htmlspecialchars($i['item_name'])." (متاح: {$i['current_stock']}) - السعر: " . number_format($i['selling_price'],2) . " SDG</option>";
                                         }
                                         ?>
                                         </optgroup>
                                     </select>
                                 </div>
 
-                                <div class="card border-success mt-3 mb-3">
-                                    <div class="card-body py-2 px-3">
-                                        <div class="row align-items-center text-center">
-                                            <div class="col-md-3">
-                                                <label class="text-muted mb-0">سعر الوحدة</label>
-                                                <input type="number" id="unit_price" class="form-control form-control-sm text-center font-weight-bold" readonly value="0.00">
-                                            </div>
-                                            <div class="col-md-1"><strong>X</strong></div>
-                                            <div class="col-md-3">
-                                                <label class="text-muted mb-0">الكمية</label>
-                                                <input type="number" id="quantity_requested" name="quantity_requested" class="form-control form-control-sm text-center font-weight-bold" min="1" value="1" required>
-                                            </div>
-                                            <div class="col-md-1"><strong>=</strong></div>
-                                            <div class="col-md-4">
-                                                <label class="text-dark font-weight-bold mb-0">الإجمالي المستحق</label>
-                                                <input type="text" id="total_cost_display" class="form-control form-control-sm text-center text-danger font-weight-bold" readonly value="0.00">
-                                            </div>
+                                <!-- Total cost card -->
+                                <div class="total-cost-card">
+                                    <div class="tc-row">
+                                        <div class="tc-item">
+                                            <span class="tc-label">سعر الوحدة</span>
+                                            <input type="number" id="unit_price" readonly value="0.00">
+                                        </div>
+                                        <div class="tc-op">×</div>
+                                        <div class="tc-item">
+                                            <span class="tc-label">الكمية</span>
+                                            <input type="number" id="quantity_requested" name="quantity_requested" min="1" value="1" required>
+                                        </div>
+                                        <div class="tc-op">=</div>
+                                        <div class="tc-item">
+                                            <span class="tc-label">الإجمالي المستحق</span>
+                                            <input type="text" id="total_cost_display" class="tc-total" readonly value="0.00">
                                         </div>
                                     </div>
                                 </div>
 
-                                <div class="row">
-                                    <div class="col-md-6">
-                                        <div class="form-group">
-                                            <label class="font-weight-bold text-success">المبلغ المستلم من المريض <span class="text-danger">*</span></label>
-                                            <input type="number" step="0.01" min="0" id="amount_paid" name="amount_paid" class="form-control form-control-lg text-success font-weight-bold" required>
-                                            <small class="text-muted">سيتم إنشاء قيد محاسبي تلقائياً في الخزينة بمجرد الدفع.</small>
+                                <div class="form-row mt-3">
+                                    <div class="form-group col-md-6 mb-0">
+                                        <label style="color:#0f9e6a;">المبلغ المستلم من المريض <span class="text-danger">*</span></label>
+                                        <div class="input-icon-wrap amount-paid">
+                                            <i class="fas fa-hand-holding-usd"></i>
+                                            <input type="number" step="0.01" min="0" id="amount_paid" name="amount_paid" class="form-control" required placeholder="0.00">
                                         </div>
+                                        <small class="form-text" style="color: var(--opd-muted); font-weight:600; margin-top:6px;">
+                                            <i class="fas fa-info-circle"></i> سيتم إنشاء قيد محاسبي تلقائياً في الخزينة بمجرد الدفع.
+                                        </small>
                                     </div>
-                                    <div class="col-md-6">
-                                        <div class="form-group">
-                                            <label class="font-weight-bold">طريقة الدفع</label>
-                                            <select name="payment_method" class="form-control form-control-lg">
-                                                <option value="cash">نقدي (كاشير)</option>
-                                                <option value="bank_transfer">تحويل بنكي (تطبيق بنكك)</option>
-                                                <option value="card">بطاقة بنكية (POS)</option>
-                                            </select>
-                                        </div>
+                                    <div class="form-group col-md-6 mb-0">
+                                        <label>طريقة الدفع</label>
+                                        <select name="payment_method" class="form-control">
+                                            <option value="cash">نقدي (كاشير)</option>
+                                            <option value="bank_transfer">تحويل بنكي (تطبيق بنكك)</option>
+                                            <option value="card">بطاقة بنكية (POS)</option>
+                                        </select>
                                     </div>
                                 </div>
+
                             </div>
-                            <div class="modal-footer bg-white">
-                                <button type="button" class="btn btn-secondary" data-dismiss="modal">إلغاء</button>
-                                <button type="submit" name="request_items" class="btn btn-success btn-lg"><i class="fas fa-print"></i> دفع وإصدار الفاتورة</button>
+                            <div class="modal-footer">
+                                <button type="button" class="btn-opd btn-opd-ghost" data-dismiss="modal">
+                                    <i class="fas fa-times"></i> إلغاء
+                                </button>
+                                <button type="submit" name="request_items" class="btn-opd btn-opd-success" style="padding:12px 26px; font-size:.88rem;">
+                                    <i class="fas fa-print"></i> دفع وإصدار الفاتورة
+                                </button>
                             </div>
                         </form>
                     </div>
                 </div>
             </div>
 
+            <!-- ==================== REQUESTS TAB ==================== -->
             <?php elseif($tab == 'requests'): ?>
-            <div class="card shadow border-0">
-                <div class="card-header bg-white"><h3 class="mb-0 text-dark font-weight-bold">الفواتير والإيصالات المالية للعيادات</h3></div>
-                <div class="table-responsive p-3">
-                    <table class="table table-hover table-flush datatable">
-                        <thead class="thead-light"><tr><th>الفاتورة</th><th>المريض</th><th>البيان</th><th>الإجمالي</th><th>حالة الدفع</th><th>القيد المالي</th><th>الوقت</th><th>خيارات</th></tr></thead>
-                        <tbody>
-                            <?php
-                            $service_reqs = $mysqli->query("SELECT sr.request_code, sr.batch_code, sr.total_cost, sr.amount_paid, sr.payment_status, sr.journal_entry_id, sr.created_at, p.name, ms.service_name FROM rpos_patient_service_requests sr JOIN rpos_patients p ON sr.patient_id = p.patient_id JOIN rpos_medical_services ms ON sr.service_id = ms.service_id ORDER BY sr.created_at DESC");
-                            while($row = $service_reqs->fetch_assoc()){
-                                $badge = ($row['payment_status'] == 'Paid') ? 'badge-success' : 'badge-danger';
-                            ?>
-                            <tr>
-                                <td class="font-weight-bold text-monospace text-primary"><?php echo htmlspecialchars($row['batch_code'] ?: $row['request_code']);?><br><small class="text-muted"><?php echo htmlspecialchars($row['request_code']);?></small></td>
-                                <td><strong><?php echo $row['name'];?></strong></td>
-                                <td><?php echo $row['service_name']; ?> <span class="badge badge-info ml-1">خدمة</span></td>
-                                <td class="text-dark font-weight-bold"><?php echo number_format($row['total_cost'], 2);?> SDG</td>
-                                <td><span class="badge <?php echo $badge;?> px-2 py-1"><?php echo $row['payment_status'];?></span></td>
-                                <td>
-                                    <?php if($row['journal_entry_id']): ?>
-                                        <span class="badge badge-dark">JE-<?php echo $row['journal_entry_id'];?></span>
-                                    <?php else: ?>
-                                        <span class="badge badge-light text-muted">بدون قيد</span>
-                                    <?php endif; ?>
-                                </td>
-                                <td><?php echo date('m-d h:i A', strtotime($row['created_at']));?></td>
-                                <td><a target="_blank" href="outpatient_management.php?action=print_receipt&ref=<?php echo urlencode($row['batch_code'] ?: $row['request_code']); ?>" class="btn btn-sm btn-outline-success"><i class="fas fa-print"></i> إيصال</a></td>
-                            </tr>
-                            <?php }
-                            $consumable_reqs = $mysqli->query("SELECT cr.request_id, cr.request_code, cr.total_cost, cr.amount_paid, cr.payment_status, cr.journal_entry_id, cr.created_at, p.name FROM rpos_patient_consumable_requests cr JOIN rpos_patients p ON cr.patient_id = p.patient_id ORDER BY cr.created_at DESC");
-                            while($row = $consumable_reqs->fetch_assoc()){
-                                $badge = ($row['payment_status'] == 'Paid') ? 'badge-success' : 'badge-danger';
-                                // نجلب أسماء المستهلكات
-                                $items_str = "";
-                                $items_res = $mysqli->query("SELECT si.item_name FROM rpos_patient_request_items pri JOIN rpos_store_items si ON pri.item_id = si.item_id WHERE pri.request_id = {$row['request_id']}");
-                                while($i = $items_res->fetch_assoc()) $items_str .= $i['item_name'] . ", ";
-                                if(empty($items_str)) $items_str = "مستهلك مسعر من العيادة";
-                            ?>
-                            <tr>
-                                <td class="font-weight-bold text-monospace text-primary"><?php echo htmlspecialchars($row['request_code']);?></td>
-                                <td><strong><?php echo $row['name'];?></strong></td>
-                                <td><span class="d-inline-block text-truncate" style="max-width: 150px;"><?php echo trim($items_str, ", "); ?></span> <span class="badge badge-warning ml-1">مستهلك</span></td>
-                                <td class="text-dark font-weight-bold"><?php echo number_format($row['total_cost'], 2);?> SDG</td>
-                                <td><span class="badge <?php echo $badge;?> px-2 py-1"><?php echo $row['payment_status'];?></span></td>
-                                <td>
-                                    <?php if($row['journal_entry_id']): ?>
-                                        <span class="badge badge-dark">JE-<?php echo $row['journal_entry_id'];?></span>
-                                    <?php else: ?>
-                                        <span class="badge badge-light text-muted">بدون قيد</span>
-                                    <?php endif; ?>
-                                </td>
-                                <td><?php echo date('m-d h:i A', strtotime($row['created_at']));?></td>
-                                <td><a target="_blank" href="outpatient_management.php?action=print_receipt&ref=<?php echo urlencode($row['request_code']); ?>" class="btn btn-sm btn-outline-success"><i class="fas fa-print"></i> إيصال</a></td>
-                            </tr>
-                            <?php } ?>
-                        </tbody>
-                    </table>
+            <div class="opd-panel">
+                <div class="opd-panel-head">
+                    <h3 class="opd-panel-title green">
+                        <span class="pt-ico"><i class="fas fa-receipt"></i></span>
+                        الفواتير والإيصالات المالية للعيادات
+                    </h3>
+                </div>
+                <div class="opd-table-wrap">
+                    <div class="table-responsive">
+                        <table class="opd-table datatable">
+                            <thead>
+                                <tr>
+                                    <th>الفاتورة</th>
+                                    <th>المريض</th>
+                                    <th>البيان</th>
+                                    <th>الإجمالي</th>
+                                    <th>حالة الدفع</th>
+                                    <th>القيد المالي</th>
+                                    <th>الوقت</th>
+                                    <th>خيارات</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php
+                                $any_req = false;
+                                $service_reqs = $mysqli->query("SELECT sr.request_code, sr.batch_code, sr.total_cost, sr.amount_paid, sr.payment_status, sr.journal_entry_id, sr.created_at, p.name, ms.service_name FROM rpos_patient_service_requests sr JOIN rpos_patients p ON sr.patient_id = p.patient_id JOIN rpos_medical_services ms ON sr.service_id = ms.service_id ORDER BY sr.created_at DESC");
+                                while($row = $service_reqs->fetch_assoc()){
+                                    $any_req = true;
+                                    $ps = $row['payment_status'];
+                                    $status_class = $ps === 'Paid' ? 'status-paid' : ($ps === 'Partially Paid' ? 'status-partial' : 'status-unpaid');
+                                    $status_label = $ps === 'Paid' ? 'مدفوع' : ($ps === 'Partially Paid' ? 'جزئي' : 'غير مدفوع');
+                                    $status_icon = $ps === 'Paid' ? 'fa-check-circle' : ($ps === 'Partially Paid' ? 'fa-adjust' : 'fa-times-circle');
+                                ?>
+                                <tr>
+                                    <td>
+                                        <div class="opd-code" style="display:inline-block;"><?php echo htmlspecialchars($row['batch_code'] ?: $row['request_code']);?></div>
+                                        <div style="margin-top:4px; font-size:.7rem; color: var(--opd-muted); font-family: 'Courier New', monospace; font-weight:700;">
+                                            <?php echo htmlspecialchars($row['request_code']);?>
+                                        </div>
+                                    </td>
+                                    <td style="font-weight:800;"><?php echo htmlspecialchars($row['name']);?></td>
+                                    <td>
+                                        <?php echo htmlspecialchars($row['service_name']); ?>
+                                        <span class="type-pill type-medical ml-1" style="font-size:.68rem;"><i class="fas fa-stethoscope"></i> خدمة</span>
+                                    </td>
+                                    <td><span class="opd-price"><?php echo number_format($row['total_cost'], 2);?> <small>SDG</small></span></td>
+                                    <td><span class="status-pill <?php echo $status_class; ?>"><i class="fas <?php echo $status_icon; ?>"></i> <?php echo $status_label; ?></span></td>
+                                    <td>
+                                        <?php if($row['journal_entry_id']): ?>
+                                            <span class="status-pill status-je"><i class="fas fa-book"></i> JE-<?php echo $row['journal_entry_id'];?></span>
+                                        <?php else: ?>
+                                            <span class="status-pill status-noje"><i class="fas fa-minus"></i> بدون قيد</span>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td><span class="date-chip"><i class="fas fa-clock"></i> <?php echo date('m-d h:i A', strtotime($row['created_at']));?></span></td>
+                                    <td>
+                                        <a target="_blank" href="outpatient_management.php?action=print_receipt&ref=<?php echo urlencode($row['batch_code'] ?: $row['request_code']); ?>" class="btn-print">
+                                            <i class="fas fa-print"></i> إيصال
+                                        </a>
+                                    </td>
+                                </tr>
+                                <?php }
+                                $consumable_reqs = $mysqli->query("SELECT cr.request_id, cr.request_code, cr.total_cost, cr.amount_paid, cr.payment_status, cr.journal_entry_id, cr.created_at, p.name FROM rpos_patient_consumable_requests cr JOIN rpos_patients p ON cr.patient_id = p.patient_id ORDER BY cr.created_at DESC");
+                                while($row = $consumable_reqs->fetch_assoc()){
+                                    $any_req = true;
+                                    $ps = $row['payment_status'];
+                                    $status_class = $ps === 'Paid' ? 'status-paid' : ($ps === 'Partially Paid' ? 'status-partial' : 'status-unpaid');
+                                    $status_label = $ps === 'Paid' ? 'مدفوع' : ($ps === 'Partially Paid' ? 'جزئي' : 'غير مدفوع');
+                                    $status_icon = $ps === 'Paid' ? 'fa-check-circle' : ($ps === 'Partially Paid' ? 'fa-adjust' : 'fa-times-circle');
+                                    // نجلب أسماء المستهلكات
+                                    $items_str = "";
+                                    $items_res = $mysqli->query("SELECT si.item_name FROM rpos_patient_request_items pri JOIN rpos_store_items si ON pri.item_id = si.item_id WHERE pri.request_id = {$row['request_id']}");
+                                    while($i = $items_res->fetch_assoc()) $items_str .= $i['item_name'] . ", ";
+                                    if(empty($items_str)) $items_str = "مستهلك مسعر من العيادة";
+                                ?>
+                                <tr>
+                                    <td><div class="opd-code" style="display:inline-block;"><?php echo htmlspecialchars($row['request_code']);?></div></td>
+                                    <td style="font-weight:800;"><?php echo htmlspecialchars($row['name']);?></td>
+                                    <td>
+                                        <span style="display:inline-block; max-width:170px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:middle;">
+                                            <?php echo htmlspecialchars(trim($items_str, ", ")); ?>
+                                        </span>
+                                        <span class="type-pill type-consumable ml-1" style="font-size:.68rem;"><i class="fas fa-box-open"></i> مستهلك</span>
+                                    </td>
+                                    <td><span class="opd-price"><?php echo number_format($row['total_cost'], 2);?> <small>SDG</small></span></td>
+                                    <td><span class="status-pill <?php echo $status_class; ?>"><i class="fas <?php echo $status_icon; ?>"></i> <?php echo $status_label; ?></span></td>
+                                    <td>
+                                        <?php if($row['journal_entry_id']): ?>
+                                            <span class="status-pill status-je"><i class="fas fa-book"></i> JE-<?php echo $row['journal_entry_id'];?></span>
+                                        <?php else: ?>
+                                            <span class="status-pill status-noje"><i class="fas fa-minus"></i> بدون قيد</span>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td><span class="date-chip"><i class="fas fa-clock"></i> <?php echo date('m-d h:i A', strtotime($row['created_at']));?></span></td>
+                                    <td>
+                                        <a target="_blank" href="outpatient_management.php?action=print_receipt&ref=<?php echo urlencode($row['request_code']); ?>" class="btn-print">
+                                            <i class="fas fa-print"></i> إيصال
+                                        </a>
+                                    </td>
+                                </tr>
+                                <?php }
+                                if (!$any_req): ?>
+                                <tr>
+                                    <td colspan="8">
+                                        <div class="opd-empty">
+                                            <div class="oe-ico"><i class="fas fa-receipt"></i></div>
+                                            <h4>لا توجد فواتير أو إيصالات بعد</h4>
+                                            <p>ستظهر الفواتير هنا بمجرد إصدار أول طلب من تبويب «سجل الفحوصات».</p>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <?php endif; ?>
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
             <?php endif; ?>
         </div>
+
+        <?php require_once('partials/_footer.php'); ?>
     </div>
     <?php require_once('partials/_scripts.php'); ?>
     <script>

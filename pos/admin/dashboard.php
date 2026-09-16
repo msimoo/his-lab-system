@@ -616,8 +616,7 @@ $month_new_patients = $mysqli->query("SELECT COUNT(*) FROM rpos_patients WHERE Y
               tooltip: {
                 backgroundColor: '#172b4d',
                 titleColor: '#fff',
-                bodyColor: '#fff',
-                //rtl: <?php echo $is_arabic ? 'true' : 'false'; ?>,
+                bodyColor: '#fff', 
                 padding: 12,
                 cornerRadius: 8,
                 callbacks: {
