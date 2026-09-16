@@ -8,7 +8,7 @@ check_login();
 
 // load departments and roles
 $departments = [];
-$resp = $mysqli->query("SELECT department_id, department_name FROM rpos_departments WHERE department_status='Active' ORDER BY department_name ASC");
+$resp = $mysqli->query("SELECT dept_id, dept_name, dept_name_en FROM rpos_departments WHERE is_active=1 ORDER BY sort_order, dept_name ASC");
 if ($resp) {
     while ($row = $resp->fetch_assoc()) {
         $departments[] = $row;
@@ -38,7 +38,7 @@ if (isset($_POST['addStaff'])) {
     $staff_join_date = !empty($_POST['staff_join_date']) ? $_POST['staff_join_date'] : date('Y-m-d');
 
     //Insert Captured information to a database table
-    $postQuery = "INSERT INTO rpos_staff (staff_number, staff_name, staff_email, staff_password, staff_status, staff_department_id, staff_role_id, staff_join_date) VALUES(?,?,?,?,?,?,?,?)";
+    $postQuery = "INSERT INTO rpos_staff (staff_number, staff_name, staff_email, staff_password, staff_status, dept_id, staff_role_id, staff_join_date) VALUES(?,?,?,?,?,?,?,?)";
     $postStmt = $mysqli->prepare($postQuery);
     //bind paramaters
     $rc = $postStmt->bind_param('sssssiis', $staff_number, $staff_name, $staff_email, $staff_password, $staff_status, $staff_department_id, $staff_role_id, $staff_join_date);
@@ -101,7 +101,7 @@ require_once('partials/_head.php');
                     <select name="staff_department_id" class="form-control">
                       <option value="">-- Select Department --</option>
                       <?php foreach($departments as $dep){ ?>
-                        <option value="<?php echo $dep['department_id']; ?>"><?php echo htmlspecialchars($dep['department_name']); ?></option>
+                        <option value="<?php echo $dep['dept_id']; ?>"><?php echo htmlspecialchars($dep['dept_name'] . (!empty($dep['dept_name_en']) ? ' / ' . $dep['dept_name_en'] : '')); ?></option>
                       <?php } ?>
                     </select>
                   </div>

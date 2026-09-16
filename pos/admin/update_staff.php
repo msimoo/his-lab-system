@@ -29,7 +29,8 @@ if (isset($_POST['UpdateStaff'])) {
     $staff_email = $_POST['staff_email'];
     $staff_password = !empty($_POST['staff_password']) ? sha1(md5($_POST['staff_password'])) : '';
     $staff_role_id = !empty($_POST['staff_role_id']) ? intval($_POST['staff_role_id']) : null;
-    $update = $_GET['update'];
+    $staff_dept_id = !empty($_POST['staff_dept_id']) ? intval($_POST['staff_dept_id']) : null;
+    $update = intval($_GET['update']);
 
     // if admin is not permitted to change role, keep existing role
     if (!in_array(strtolower($_SESSION['admin_role'] ?? ''), ['admin', 'superadmin'])) {
@@ -40,9 +41,9 @@ if (isset($_POST['UpdateStaff'])) {
     }
 
     // Update Captured information in a database table
-    $sql = "UPDATE rpos_staff SET staff_number = ?, staff_name = ?, staff_email = ?, staff_role_id = ?";
-    $params = [$staff_number, $staff_name, $staff_email, $staff_role_id];
-    $types = 'sssi';
+    $sql = "UPDATE rpos_staff SET staff_number = ?, staff_name = ?, staff_email = ?, dept_id = ?, staff_role_id = ?";
+    $params = [$staff_number, $staff_name, $staff_email, $staff_dept_id, $staff_role_id];
+    $types = 'sssii';
     if (!empty($staff_password)) {
         $sql .= ", staff_password = ?";
         $params[] = $staff_password;
@@ -129,6 +130,15 @@ require_once('partials/_head.php');
                   </div>
 
                   <div class="form-row">
+                    <div class="col-md-6">
+                      <label>Department</label>
+                      <select name="staff_dept_id" class="form-control">
+                        <option value="">-- Select department --</option>
+                        <?php $deptRes = $mysqli->query("SELECT dept_id, dept_name, dept_name_en FROM rpos_departments WHERE is_active=1 ORDER BY sort_order, dept_name"); if ($deptRes) while ($dept = $deptRes->fetch_assoc()): ?>
+                          <option value="<?php echo intval($dept['dept_id']); ?>" <?php echo (intval($staff->dept_id ?? 0) === intval($dept['dept_id'])) ? 'selected' : ''; ?>><?php echo htmlspecialchars($dept['dept_name'] . ($dept['dept_name_en'] ? ' / ' . $dept['dept_name_en'] : '')); ?></option>
+                        <?php endwhile; ?>
+                      </select>
+                    </div>
                     <div class="col-md-6">
                       <label><?php echo __('staff_Email'); ?></label>
                       <input type="email" name="staff_email" class="form-control" value="<?php echo $staff->staff_email; ?>">

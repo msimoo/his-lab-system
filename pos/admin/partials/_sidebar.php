@@ -618,8 +618,11 @@ if (!function_exists('__')) {
               <i class="fas fa-clinic-medical icon-blue"></i> <?php echo __('clinics'); ?>
             </a>
           </li>
-          <?php endif; ?>
-          <?php if (isSuperAdmin($admin->admin_id) || userHasPagePermission($mysqli, $admin->admin_id, 'doctor_appointments.php')): ?>
+  <?php endif; ?>
+  <?php if (isSuperAdmin($admin->admin_id) || userHasPagePermission($mysqli, $admin->admin_id, 'departments.php')): ?>
+  <li class="nav-item<?php echo sidebar_active('departments.php', $current_page); ?>"><a class="nav-link" href="departments.php"><i class="fas fa-sitemap icon-violet"></i> <?php echo __('departments'); ?></a></li>
+  <?php endif; ?>
+  <?php if (isSuperAdmin($admin->admin_id) || userHasPagePermission($mysqli, $admin->admin_id, 'doctor_appointments.php')): ?>
           <li class="nav-item<?php echo sidebar_active('doctor_appointments.php', $current_page); ?>">
             <a class="nav-link" href="doctor_appointments.php">
               <i class="fas fa-calendar-alt icon-indigo"></i> <?php echo __('doctor_appointments'); ?>

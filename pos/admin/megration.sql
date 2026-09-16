@@ -256,6 +256,42 @@ DELIMITER ;
 SET FOREIGN_KEY_CHECKS = 1;
 
 -- ============================================================
+-- PART 14: Departments Foundation
+-- ============================================================
+CREATE TABLE IF NOT EXISTS rpos_departments (
+    dept_id INT AUTO_INCREMENT PRIMARY KEY,
+    dept_code VARCHAR(20) NOT NULL UNIQUE,
+    dept_name VARCHAR(120) NOT NULL,
+    dept_name_en VARCHAR(120) NULL,
+    dept_type ENUM('Clinical','Diagnostic','Pharmacy','Admin','Support') NOT NULL DEFAULT 'Clinical',
+    parent_dept_id INT NULL,
+    clinic_id INT NULL,
+    cost_center_id INT NULL,
+    revenue_account_id INT NULL,
+    expense_account_id INT NULL,
+    location VARCHAR(120) NULL,
+    phone VARCHAR(30) NULL,
+    manager_staff_id INT NULL,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_dept_parent (parent_dept_id), INDEX idx_dept_type (dept_type), INDEX idx_dept_active (is_active),
+    FOREIGN KEY (parent_dept_id) REFERENCES rpos_departments(dept_id) ON DELETE SET NULL,
+    FOREIGN KEY (cost_center_id) REFERENCES rpos_cost_centers(cost_center_id) ON DELETE SET NULL,
+    FOREIGN KEY (revenue_account_id) REFERENCES rpos_accounts(account_id) ON DELETE SET NULL,
+    FOREIGN KEY (expense_account_id) REFERENCES rpos_accounts(account_id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+SET @sql := IF((SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='rpos_clinics' AND column_name='dept_id')=0, 'ALTER TABLE rpos_clinics ADD COLUMN dept_id INT NULL', 'SELECT 1'); PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @sql := IF((SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='rpos_clinics' AND column_name='cost_center_id')=0, 'ALTER TABLE rpos_clinics ADD COLUMN cost_center_id INT NULL', 'SELECT 1'); PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @sql := IF((SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='rpos_clinics' AND column_name='revenue_account_id')=0, 'ALTER TABLE rpos_clinics ADD COLUMN revenue_account_id INT NULL', 'SELECT 1'); PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @sql := IF((SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='rpos_staff' AND column_name='dept_id')=0, 'ALTER TABLE rpos_staff ADD COLUMN dept_id INT NULL', 'SELECT 1'); PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+INSERT IGNORE INTO rpos_cost_centers (cost_center_code,cost_center_name) VALUES ('CC-RAD','الأشعة والتصوير'),('CC-IPD','قسم التنويم');
+INSERT IGNORE INTO rpos_departments (dept_code,dept_name,dept_name_en,dept_type,cost_center_id)
+SELECT s.code,s.name,s.name_en,s.type,c.cost_center_id FROM (SELECT 'OPD' code,'العيادات الخارجية' name,'Outpatient Clinics' name_en,'Clinical' type,'CC-OPD' cc UNION ALL SELECT 'LAB','المختبر','Laboratory','Diagnostic','CC-LAB' UNION ALL SELECT 'RAD','الأشعة والتصوير','Radiology & Imaging','Diagnostic','CC-RAD' UNION ALL SELECT 'PHARM','الصيدلية','Pharmacy','Pharmacy','CC-PHARM' UNION ALL SELECT 'ER','الطوارئ','Emergency','Clinical','CC-ER' UNION ALL SELECT 'IPD','قسم التنويم','Inpatient Ward','Clinical','CC-IPD' UNION ALL SELECT 'ADMIN','الإدارة','Administration','Admin','CC-ADMIN' UNION ALL SELECT 'FIN','المالية','Finance','Admin','CC-FIN' UNION ALL SELECT 'HR','الموارد البشرية','Human Resources','Support','CC-HR') s LEFT JOIN rpos_cost_centers c ON c.cost_center_code=s.cc;
+
+-- ============================================================
 -- DONE — Verify with:
 -- SELECT 'Migration complete' AS status;
 -- ============================================================
